@@ -1,0 +1,22 @@
+__include__: [
+  './rtv4_hgnetv2_s_grape_point_v5_common.yml'
+]
+
+output_dir: ./outputs/grape_point_v5_exp1_dense
+
+RTv4Criterion:
+  weight_dict:
+    loss_mal: 1
+    loss_bbox: 5
+    loss_giou: 2
+    loss_fgl: 0.15
+    loss_ddf: 1.5
+    loss_has_picking: 1.2
+    loss_picking_offset: 4.0
+    loss_dense_has_picking: 0.20
+    loss_dense_picking_offset: 0.60
+  losses: ['mal', 'boxes', 'local', 'has_picking', 'picking_offset', 'dense_has_picking', 'dense_picking_offset']
+  dense_positive_iou_thresh: 0.55
+  dense_positive_topk: 2
+  lambda_dense_has: 0.20
+  lambda_dense_point: 0.60

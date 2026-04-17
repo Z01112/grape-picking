@@ -1,0 +1,40 @@
+__include__: [
+  './rtv4_hgnetv2_s_grape_point_v2.yml'
+]
+
+output_dir: ./outputs/grape_point_v4_common
+
+DFINETransformer:
+  point_instance_binding_mode: none
+  point_size_condition: False
+  point_full_local_width_scale: 1.05
+  point_full_local_height_scale: 1.05
+  point_full_local_y_shift: 0.0
+  point_top_local_width_scale: 1.08
+  point_top_local_y_min_ratio: -0.10
+  point_top_local_y_max_ratio: 0.40
+
+PostProcessor:
+  point_decode_clamp_x_abs: ~
+  point_decode_clamp_y_min: ~
+  point_decode_clamp_y_max: ~
+
+RTv4Criterion:
+  weight_dict:
+    loss_mal: 1
+    loss_bbox: 5
+    loss_giou: 2
+    loss_fgl: 0.15
+    loss_ddf: 1.5
+    loss_has_picking: 1.2
+    loss_picking_offset: 4.0
+    loss_picking_locality: 0.0
+  losses: ['mal', 'boxes', 'local', 'has_picking', 'picking_offset']
+  point_coord_weight_x: 1.0
+  point_coord_weight_y: 1.0
+  point_small_grape_area_threshold: 0.0
+  point_small_grape_weight: 1.0
+  point_locality_x_abs_max: 1.0
+  point_locality_y_min: -1.0
+  point_locality_y_max: 1.0
+  point_locality_power: 2.0

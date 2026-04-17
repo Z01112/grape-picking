@@ -1,0 +1,27 @@
+__include__: [
+  './rtv4_hgnetv2_s_grape_point_v6_exp1.yml'
+]
+
+output_dir: ./outputs/grape_point_v7_exp1_query_box_top_center
+
+train_dataloader:
+  dataset:
+    regenerate_point_offsets: True
+    point_offset_mode: top_center
+    point_top_anchor_ratio: 0.12
+
+val_dataloader:
+  dataset:
+    regenerate_point_offsets: True
+    point_offset_mode: top_center
+    point_top_anchor_ratio: 0.12
+
+PostProcessor:
+  use_picking_point: True
+  has_picking_threshold: 0.5
+  point_offset_mode: top_center
+  point_top_anchor_ratio: 0.12
+
+RTv4Criterion:
+  point_coord_weight_x: 1.0
+  point_coord_weight_y: 1.30

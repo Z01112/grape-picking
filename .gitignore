@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+runs/
+wandb/
+
+# Model weights
+*.pth
+*.pt
+*.onnx
+*.engine
+*.ckpt
+*.partial
+
+# Outputs and reports
+/outputs/
+/debug_vis/
+/qualitative_cases/
+/error_analysis/
+/report/
+/reports/
+
+# Temp / cache
+/tmp/
+/temp/
+/cache/
+/_runtime_sessions/
+/_scratch/
+.ipynb_checkpoints/
+
+# Data / big assets / external code
+/dataset/
+/pretrain/
+/third_party/
+
+# Local run markers
+/scripts/.last_*.txt
+
+# Data/cache-like
+*.cache
+*.pkl

@@ -1,0 +1,11 @@
+__include__: [
+  './rtv4_hgnetv2_s_grape_point_v7_exp1.yml'
+]
+
+output_dir: ./outputs/grape_point_v7_exp2_query_box_top_center_toproi
+
+DFINETransformer:
+  point_instance_binding_mode: query_box_top
+  point_top_local_width_scale: 1.08
+  point_top_local_y_min_ratio: -0.10
+  point_top_local_y_max_ratio: 0.40
