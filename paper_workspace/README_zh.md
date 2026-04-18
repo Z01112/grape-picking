@@ -1,6 +1,7 @@
 # 论文写作工作区
 
 这份索引只保留当前论文主线真正需要打开的入口，避免后续在母目录里来回翻旧实验。
+这里的很多链接面向本地工作区使用，因此在 GitHub 网页端不一定都能直接打开。
 
 ## 当前主线代码
 - 训练入口：[train.py](/D:/Projects/RT-DETR/RT-DETRv4/train.py)
@@ -21,7 +22,7 @@
 - `v7_exp2` 报告：[summary.json](/D:/Projects/RT-DETR/RT-DETRv4/outputs/grape_point_v7_exp2_query_box_top_center_toproi/report/summary.json)
 - `small_weight` 报告：[summary.json](/D:/Projects/RT-DETR/RT-DETRv4/outputs/grape_point_v7_exp2_small_weight/report/summary.json)
 - `small_weight` 新变体对比：[new_variant_summary.json](/D:/Projects/RT-DETR/RT-DETRv4/outputs/grape_point_v7_exp2_small_weight/new_variant_summary.json)
-- `tight_toproi` 负结果保留：[new_variant_summary.json](/D:/Projects/RT-DETR/RT-DETRv4/outputs/grape_point_v7_exp2_tight_toproi/new_variant_summary.json)
+- `tight_toproi` 负结果保留：[summary_zh.md](/D:/Projects/RT-DETR/RT-DETRv4/outputs/history_suites/negative_variants/v7_exp2_tight_toproi/summary_zh.md)
 
 ## 论文资产
 - 中文期刊版资产：[grape_point_v7_paper_ready](/D:/Projects/RT-DETR/RT-DETRv4/outputs/grape_point_v7_paper_ready)
