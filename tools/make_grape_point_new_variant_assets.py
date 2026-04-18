@@ -12,8 +12,6 @@ import numpy as np
 
 from make_grape_point_v2_report import collect_case_groups, evaluate_split, safe_float
 from make_grape_point_v7_paper_assets import (
-    build_scene_slice_rows,
-    build_scene_slice_table,
     build_scene_slices,
     extract_test_metrics,
     get_has_picking_threshold,
@@ -38,11 +36,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--new-label", default="new_variant")
+    parser.add_argument("--variant-title", default="new variant 中文结论")
     return parser.parse_args()
 
 
-def plot_overview(metrics_by_name: dict[str, dict], out_path: Path) -> None:
-    labels = ["baseline_replay", "v7_exp1", "v7_exp2", "tight_toproi"]
+def plot_overview(metrics_by_name: dict[str, dict], out_path: Path, new_label: str) -> None:
+    labels = ["baseline_replay", "v7_exp1", "v7_exp2", new_label]
     x = np.arange(len(labels), dtype=np.float64)
     grape_ap = [metrics_by_name[name]["grape_AP"] for name in labels]
     f1 = [metrics_by_name[name]["has_picking_F1"] for name in labels]
@@ -89,13 +89,17 @@ def plot_overview(metrics_by_name: dict[str, dict], out_path: Path) -> None:
     plt.close(fig)
 
 
-def build_scene_table_rows(scene_slices: dict[str, dict[str, set[tuple[int, int]]]], model_cases: dict[str, list[dict]]) -> list[dict]:
+def build_scene_table_rows(
+    scene_slices: dict[str, dict[str, set[tuple[int, int]]]],
+    model_cases: dict[str, list[dict]],
+    new_label: str,
+) -> list[dict]:
     rows = []
     for family, groups in scene_slices.items():
         for label, keys in groups.items():
             baseline_summary = summarize_scene_slice(model_cases["baseline_replay"], keys)
             exp2_summary = summarize_scene_slice(model_cases["v7_exp2"], keys)
-            new_summary = summarize_scene_slice(model_cases["tight_toproi"], keys)
+            new_summary = summarize_scene_slice(model_cases[new_label], keys)
             rows.append(
                 {
                     "slice_family": family,
@@ -170,10 +174,17 @@ def write_new_variant_scene_csv(path: Path, rows: list[dict], notes: dict) -> No
             writer.writerow(payload)
 
 
-def write_report(path: Path, metrics_by_name: dict[str, dict], scene_rows: list[dict], notes: dict) -> None:
+def write_report(
+    path: Path,
+    metrics_by_name: dict[str, dict],
+    scene_rows: list[dict],
+    notes: dict,
+    new_label: str,
+    variant_title: str,
+) -> None:
     baseline = metrics_by_name["baseline_replay"]
     exp2 = metrics_by_name["v7_exp2"]
-    new = metrics_by_name["tight_toproi"]
+    new = metrics_by_name[new_label]
     exp1 = metrics_by_name["v7_exp1"]
     family_titles = {
         "single_vs_multi": "单串 / 多串相邻",
@@ -190,13 +201,13 @@ def write_report(path: Path, metrics_by_name: dict[str, dict], scene_rows: list[
     }
 
     lines = [
-        "# tight top-local ROI 中文结论",
+        f"# {variant_title}",
         "",
         "## 核心指标",
         f"- baseline_replay: AP={baseline['grape_AP']:.4f}, F1={baseline['has_picking_F1']:.4f}, pair_count={baseline['pair_count']}, mean L2={baseline['mean_L2']:.2f}px, |dy|={baseline['mean_abs_dy']:.2f}px。",
         f"- v7_exp1: AP={exp1['grape_AP']:.4f}, F1={exp1['has_picking_F1']:.4f}, pair_count={exp1['pair_count']}, mean L2={exp1['mean_L2']:.2f}px, |dy|={exp1['mean_abs_dy']:.2f}px。",
         f"- v7_exp2: AP={exp2['grape_AP']:.4f}, F1={exp2['has_picking_F1']:.4f}, pair_count={exp2['pair_count']}, mean L2={exp2['mean_L2']:.2f}px, |dy|={exp2['mean_abs_dy']:.2f}px。",
-        f"- tight_toproi: AP={new['grape_AP']:.4f}, F1={new['has_picking_F1']:.4f}, pair_count={new['pair_count']}, mean L2={new['mean_L2']:.2f}px, |dy|={new['mean_abs_dy']:.2f}px。",
+        f"- {new_label}: AP={new['grape_AP']:.4f}, F1={new['has_picking_F1']:.4f}, pair_count={new['pair_count']}, mean L2={new['mean_L2']:.2f}px, |dy|={new['mean_abs_dy']:.2f}px。",
         "",
         "## 相对 v7_exp2 变化",
         f"- ΔAP={new['grape_AP'] - exp2['grape_AP']:+.4f}",
@@ -237,9 +248,9 @@ def write_report(path: Path, metrics_by_name: dict[str, dict], scene_rows: list[
     lines.extend(
         [
             "## 判断",
-            "- 候选 B 是否值得继续多 seed："
+            "- 当前候选是否值得继续多 seed："
             + ("值得，建议继续做多 seed。" if worth_multiseed and heavy_or_multi_improved else "暂不值得直接做多 seed。"),
-            "- 如果这版没有同时压低 mean L2 / |dy|，且 heavy occlusion 或多串相邻没有改善，就回头跑候选 A。",
+            "- 如果这版没有同时压低 mean L2 / |dy|，且复杂场景也没有改善，就不建议继续扩 seed。",
             "",
         ]
     )
@@ -257,7 +268,7 @@ def main() -> None:
         "baseline_replay": extract_test_metrics(baseline_summary),
         "v7_exp1": extract_test_metrics(exp1_summary),
         "v7_exp2": extract_test_metrics(exp2_summary),
-        "tight_toproi": extract_test_metrics(new_summary),
+        args.new_label: extract_test_metrics(new_summary),
     }
 
     run_dir = Path(new_summary["run_dir"]).resolve()
@@ -266,12 +277,12 @@ def main() -> None:
     out_scene = run_dir / "new_variant_scene_slice_table.csv"
     out_report = run_dir / "new_variant_comparison_report_zh.md"
 
-    plot_overview(metrics_by_name, out_overview)
+    plot_overview(metrics_by_name, out_overview, args.new_label)
 
     record_specs = {
         "baseline_replay": baseline_summary,
         "v7_exp2": exp2_summary,
-        "tight_toproi": new_summary,
+        args.new_label: new_summary,
     }
     eval_records = {}
     thresholds = {}
@@ -293,12 +304,12 @@ def main() -> None:
 
     scene_slices, scene_notes = build_scene_slices(eval_records["baseline_replay"])
     model_cases = {}
-    for name in ("baseline_replay", "v7_exp2", "tight_toproi"):
+    for name in ("baseline_replay", "v7_exp2", args.new_label):
         correct_pairs, _, _ = collect_case_groups(eval_records[name], 0.5, thresholds[name])
         model_cases[name] = correct_pairs
-    scene_rows = build_scene_table_rows(scene_slices, model_cases)
+    scene_rows = build_scene_table_rows(scene_slices, model_cases, args.new_label)
     write_new_variant_scene_csv(out_scene, scene_rows, scene_notes)
-    write_report(out_report, metrics_by_name, scene_rows, scene_notes)
+    write_report(out_report, metrics_by_name, scene_rows, scene_notes, args.new_label, args.variant_title)
 
     summary_payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),

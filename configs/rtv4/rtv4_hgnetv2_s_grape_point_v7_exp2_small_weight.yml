@@ -1,0 +1,9 @@
+__include__: [
+  './rtv4_hgnetv2_s_grape_point_v7_exp2.yml'
+]
+
+output_dir: ./outputs/grape_point_v7_exp2_small_weight
+
+RTv4Criterion:
+  point_small_grape_area_threshold: 0.07510009765625
+  point_small_grape_weight: 1.5

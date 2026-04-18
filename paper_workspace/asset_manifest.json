@@ -1,0 +1,37 @@
+{
+  "core_code": {
+    "train": "D:\\Projects\\RT-DETR\\RT-DETRv4\\train.py",
+    "report_core": "D:\\Projects\\RT-DETR\\RT-DETRv4\\tools\\make_grape_point_v2_report.py",
+    "variant_assets": "D:\\Projects\\RT-DETR\\RT-DETRv4\\tools\\make_grape_point_new_variant_assets.py",
+    "paper_assets": "D:\\Projects\\RT-DETR\\RT-DETRv4\\tools\\make_grape_point_v7_paper_assets.py",
+    "sci_assets": "D:\\Projects\\RT-DETR\\RT-DETRv4\\tools\\make_grape_point_v7_sci_assets.py"
+  },
+  "core_configs": {
+    "baseline": "D:\\Projects\\RT-DETR\\RT-DETRv4\\configs\\rtv4\\rtv4_hgnetv2_s_grape_point_v2.yml",
+    "v7_exp1": "D:\\Projects\\RT-DETR\\RT-DETRv4\\configs\\rtv4\\rtv4_hgnetv2_s_grape_point_v7_exp1.yml",
+    "v7_exp2": "D:\\Projects\\RT-DETR\\RT-DETRv4\\configs\\rtv4\\rtv4_hgnetv2_s_grape_point_v7_exp2.yml",
+    "small_weight": "D:\\Projects\\RT-DETR\\RT-DETRv4\\configs\\rtv4\\rtv4_hgnetv2_s_grape_point_v7_exp2_small_weight.yml"
+  },
+  "main_outputs": {
+    "baseline_report": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\grape_point_v6_baseline_replay\\report\\summary.json",
+    "v7_exp1_report": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\grape_point_v7_exp1_query_box_top_center\\report\\summary.json",
+    "v7_exp2_report": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\grape_point_v7_exp2_query_box_top_center_toproi\\report\\summary.json",
+    "small_weight_report": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\grape_point_v7_exp2_small_weight\\report\\summary.json",
+    "small_weight_variant": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\grape_point_v7_exp2_small_weight\\new_variant_summary.json",
+    "history_summary": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\history_suites\\history_evolution_table.csv"
+  },
+  "writing_assets": {
+    "paper_ready_dir": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\grape_point_v7_paper_ready",
+    "sci_ready_dir": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\grape_point_v7_sci_ready",
+    "sci_summary": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\grape_point_v7_sci_ready\\sci_ready_summary.json",
+    "sci_claims": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\grape_point_v7_sci_ready\\sci_claims_zh.md",
+    "sci_storyline": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\grape_point_v7_sci_ready\\sci_storyline_zh.md"
+  },
+  "history_assets": {
+    "history_root": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\history_suites",
+    "history_readme": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\history_suites\\README_zh.md",
+    "v6_exp1_summary": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\history_suites\\negative_variants\\v6_exp1_instance_binding\\summary_zh.md",
+    "v6_exp2_summary": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\history_suites\\negative_variants\\v6_exp2_instance_binding_relative\\summary_zh.md",
+    "tight_toproi_summary": "D:\\Projects\\RT-DETR\\RT-DETRv4\\outputs\\history_suites\\negative_variants\\v7_exp2_tight_toproi\\summary_zh.md"
+  }
+}
