@@ -10,7 +10,6 @@ from .rtv4 import RTv4
 
 from .matcher import HungarianMatcher
 from .hybrid_encoder import HybridEncoder
-from .hybrid_encoder_asff import HybridEncoderASFF
 from .dfine_decoder import DFINETransformer
 from .rtdetrv2_decoder import RTDETRTransformerv2
 

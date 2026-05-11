@@ -324,6 +324,9 @@ class GrapePointEvaluator(CocoEvaluator):
         if not self.point_records:
             return {"grape_point_metrics": {}}
 
+        # The picking metrics are computed after IoU matching between predicted
+        # grape boxes and GT grape boxes. They measure the instance-level chain:
+        # grape matched -> visible point predicted -> point error accumulated.
         matched_grapes = sum(int(item["matched_grapes"]) for item in self.point_records)
         matched_visible_grapes = sum(int(item["matched_visible_grapes"]) for item in self.point_records)
         predicted_visible = sum(int(item["predicted_visible"]) for item in self.point_records)
@@ -335,6 +338,7 @@ class GrapePointEvaluator(CocoEvaluator):
         sum_abs_y = sum(float(item["sum_abs_y"]) for item in self.point_records)
         sum_l2 = sum(float(item["sum_l2"]) for item in self.point_records)
 
+        # has_picking F1 evaluates the visibility decision on matched grapes.
         precision = float(correct_visible / predicted_visible) if predicted_visible > 0 else 0.0
         recall = float(correct_visible / matched_visible_grapes) if matched_visible_grapes > 0 else 0.0
         f1 = 0.0 if precision + recall == 0 else float(2 * precision * recall / (precision + recall))
@@ -348,6 +352,8 @@ class GrapePointEvaluator(CocoEvaluator):
             "has_picking_f1": f1,
             "has_picking_false_positive": false_visible,
             "has_picking_false_negative": missed_visible,
+            # point_pair_count is the number of matched grapes where both GT
+            # and prediction are visible; L2 and |dy| are averaged over it.
             "point_pair_count": point_pairs,
             "point_mae_x_px": float(sum_abs_x / point_pairs) if point_pairs > 0 else 0.0,
             "point_mae_y_px": float(sum_abs_y / point_pairs) if point_pairs > 0 else 0.0,
@@ -465,6 +471,7 @@ class GrapePointEvaluator(CocoEvaluator):
                 pred_point = pred_points[pred_idx]
                 gt_point = gt_points[gt_idx]
                 diff = pred_point - gt_point
+                # These sums become mean |dx|, mean |dy|, and mean L2.
                 sum_abs_x += abs(float(diff[0].item()))
                 sum_abs_y += abs(float(diff[1].item()))
                 sum_l2 += float(torch.linalg.norm(diff, ord=2).item())

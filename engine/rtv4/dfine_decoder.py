@@ -524,6 +524,8 @@ class DFINETransformer(nn.Module):
         self.point_offset_max = float(point_offset_max)
         if self.point_offset_max <= self.point_offset_min:
             self.point_offset_max = self.point_offset_min + 1.0
+        # GPPoint-DETR keeps the detector queries intact and changes only how
+        # the per-query point feature is enriched before has/offset prediction.
         self.point_legacy_local_feature = self.point_instance_binding_mode == 'legacy' and self.point_local_feature_fusion
         self.point_use_full_local_feature = self.point_instance_binding_mode in ('full', 'full_top')
         self.point_use_top_local_feature = self.point_instance_binding_mode in ('top', 'full_top', 'query_box_top')
@@ -600,6 +602,8 @@ class DFINETransformer(nn.Module):
         self.dec_point_fusion_head = None
         self.pre_point_fusion_head = None
         if self.use_picking_point_head:
+            # Per-query picking heads: one binary visible-point logit and one
+            # 2-D normalized offset for each decoder query.
             point_hidden_dim = max(int(round(hidden_dim * self.point_head_hidden_scale)), 1)
             point_hidden_dim_scaled = max(int(round(scaled_dim * self.point_head_hidden_scale)), 1)
             self.dec_picking_head = nn.ModuleList(
@@ -827,6 +831,12 @@ class DFINETransformer(nn.Module):
         return torch.stack((x1, y1, x2, y2), dim=-1)
 
     def _build_point_top_rois(self, boxes_cxcywh: torch.Tensor, feat_h: int, feat_w: int) -> torch.Tensor:
+        """Build the Top Local ROI used by the GPPoint-DETR point branch.
+
+        The input boxes are normalized cxcywh query boxes. The ROI is centered
+        horizontally on the query box but vertically expressed relative to the
+        top edge, matching the paper's upper-peduncle local cue.
+        """
         boxes = boxes_cxcywh.to(torch.float32)
         cx, cy, w, h = boxes.unbind(-1)
         roi_w = (w * self.point_top_local_width_scale).clamp(min=1e-6)
@@ -883,6 +893,13 @@ class DFINETransformer(nn.Module):
         box_geom_proj_head,
         fusion_head,
     ) -> torch.Tensor:
+        """Fuse query, box geometry, and optional local cues for point heads.
+
+        In query_box_top mode this combines decoder hidden state, top-local ROI
+        evidence, query positional embedding, and predicted-box geometry. The
+        fused feature is still tied to the same object query, not a new ROI
+        detector proposal.
+        """
         parts = [hidden]
         if legacy_local_proj_head is not None:
             legacy_local_feat = self._pool_point_local_features(proj_feats, boxes_cxcywh, roi_type='legacy')
@@ -919,6 +936,7 @@ class DFINETransformer(nn.Module):
         box_geom_proj_head,
         fusion_head,
     ):
+        """Predict per-query has_picking logits and point offsets."""
         point_feature = self._fuse_point_feature(
             hidden,
             boxes_cxcywh,
@@ -1283,6 +1301,7 @@ class DFINETransformer(nn.Module):
         else:
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
         if out_picking_logits is not None:
+            # Final per-query outputs consumed by criterion and postprocessor.
             out['pred_has_picking'] = out_picking_logits[-1]
             out['pred_picking_offsets'] = out_picking_offsets[-1]
 

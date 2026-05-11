@@ -1,0 +1,5 @@
+__include__: [
+  './rtv4_hgnetv2_s_grape_point_v7_exp2.yml'
+]
+
+# Semantic alias for the current main model.

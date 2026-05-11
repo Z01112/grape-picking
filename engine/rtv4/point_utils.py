@@ -32,6 +32,12 @@ def _point_anchor_from_xywh_bbox(
     mode: str = "center",
     top_anchor_ratio: float = 0.0,
 ) -> list[float]:
+    """Return the reference anchor used to encode a picking point.
+
+    top_center uses the horizontal box center and a y position measured from
+    the top edge: y_top + top_anchor_ratio * h. This is the geometric prior
+    described in the paper.
+    """
     x, y, w, h = [float(v) for v in box_xywh]
     mode = _normalize_point_offset_mode(mode)
     if mode == "bbox_relative":
@@ -50,6 +56,7 @@ def offset_from_xywh_bbox(
     mode: str = "center",
     top_anchor_ratio: float = 0.0,
 ) -> list[float]:
+    """Encode an absolute point as a width/height-normalized offset."""
     px, py = [float(v) for v in point_xy]
     anchor_x, anchor_y = _point_anchor_from_xywh_bbox(
         box_xywh,
@@ -69,6 +76,11 @@ def absolute_points_from_boxes_and_offsets(
     mode: str = "center",
     top_anchor_ratio: float = 0.0,
 ) -> torch.Tensor:
+    """Decode normalized offsets into image-coordinate picking points.
+
+    For GPPoint-DETR, mode='top_center' means the offset origin is near the
+    upper center of each predicted grape box instead of the bbox center.
+    """
     boxes_cxcywh = boxes_cxcywh.to(torch.float32)
     offsets_xy = offsets_xy.to(torch.float32)
     mode = _normalize_point_offset_mode(mode)
@@ -98,6 +110,7 @@ def normalized_offsets_from_boxes_and_points(
     mode: str = "center",
     top_anchor_ratio: float = 0.0,
 ) -> torch.Tensor:
+    """Generate training targets matching absolute_points_from_boxes_and_offsets."""
     boxes_cxcywh = boxes_cxcywh.to(torch.float32)
     points_xy = points_xy.to(torch.float32)
     mode = _normalize_point_offset_mode(mode)

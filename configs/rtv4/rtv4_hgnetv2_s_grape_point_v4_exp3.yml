@@ -1,8 +1,0 @@
-__include__: [
-  './rtv4_hgnetv2_s_grape_point_v4_common.yml'
-]
-
-output_dir: ./outputs/grape_point_v4_exp3_full_top_roi
-
-DFINETransformer:
-  point_instance_binding_mode: full_top

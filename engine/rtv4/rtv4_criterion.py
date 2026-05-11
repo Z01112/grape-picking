@@ -321,6 +321,11 @@ class RTv4Criterion(nn.Module):
         return losses
 
     def loss_has_picking(self, outputs, targets, indices, num_boxes, **kwargs):
+        """Binary visibility loss for the matched grape queries.
+
+        has_picking is an instance attribute: it is supervised only after the
+        normal Hungarian grape-box matching has paired each query with a GT box.
+        """
         if 'pred_has_picking' not in outputs:
             return {}
 
@@ -338,6 +343,7 @@ class RTv4Criterion(nn.Module):
         return {'loss_has_picking': loss}
 
     def _gather_matched_point_examples(self, outputs, targets, indices):
+        """Collect point targets for the same matched queries used by box loss."""
         idx = self._get_src_permutation_idx(indices)
         src_offsets = outputs['pred_picking_offsets'][idx]
         if src_offsets.numel() == 0:
@@ -443,6 +449,7 @@ class RTv4Criterion(nn.Module):
         return self._dense_positive_cache
 
     def loss_picking_offset(self, outputs, targets, indices, num_boxes, **kwargs):
+        """Point-offset regression loss for visible picking points only."""
         if 'pred_picking_offsets' not in outputs:
             return {}
 
@@ -450,11 +457,14 @@ class RTv4Criterion(nn.Module):
         if src_offsets.numel() == 0:
             return {'loss_picking_offset': outputs['pred_picking_offsets'].sum() * 0.0}
 
+        # Invisible or undefined picking points should not force a point target.
         valid = target_has_picking > 0.5
         if not valid.any():
             return {'loss_picking_offset': outputs['pred_picking_offsets'].sum() * 0.0}
 
         point_loss = self.compute_point_loss(src_offsets[valid], target_offsets[valid])
+        # The main GPPoint-DETR config sets y weight higher than x to emphasize
+        # the historical vertical drift error (|dy|).
         coord_weights = torch.as_tensor(
             [self.point_coord_weight_x, self.point_coord_weight_y],
             dtype=point_loss.dtype,
@@ -464,6 +474,8 @@ class RTv4Criterion(nn.Module):
 
         sample_weights = torch.ones((int(valid.sum().item()), 1), dtype=point_loss.dtype, device=point_loss.device)
         if self.point_small_grape_weight > 1.0 and self.point_small_grape_area_threshold > 0.0:
+            # Disabled in the main model. Enabled only for the small_weight
+            # auxiliary experiment to up-weight small-grape point samples.
             areas = (target_boxes[valid, 2] * target_boxes[valid, 3]).to(dtype=point_loss.dtype)
             small_mask = areas <= self.point_small_grape_area_threshold
             if small_mask.any():

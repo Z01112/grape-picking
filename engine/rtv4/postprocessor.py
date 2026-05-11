@@ -113,6 +113,8 @@ class PostProcessor(nn.Module):
             pred_has_picking = outputs['pred_has_picking']
             pred_offsets = outputs['pred_picking_offsets']
 
+            # Keep point outputs aligned with the same top-k grape queries used
+            # for labels/scores/boxes.
             if self.use_focal_loss or scores.shape[1] != pred_has_picking.shape[1]:
                 pred_has_picking = pred_has_picking.gather(
                     dim=1,
@@ -143,6 +145,8 @@ class PostProcessor(nn.Module):
                     mode=self.point_offset_mode,
                     top_anchor_ratio=self.point_top_anchor_ratio,
                 )
+            # Decode every retained query into an image-coordinate candidate
+            # point; has_picking then marks which candidates are valid.
             picking_points = absolute_points_from_boxes_and_offsets(
                 abs_boxes_cxcywh,
                 pred_offsets,
@@ -151,6 +155,9 @@ class PostProcessor(nn.Module):
             )
             picking_points = clamp_points_to_image(picking_points, orig_target_sizes)
 
+            # The 0.5 threshold in the main config gates valid picking points
+            # for evaluation or downstream use, but the candidate coordinates
+            # remain available for visualization/debugging.
             has_picking_scores = F.sigmoid(pred_has_picking).squeeze(-1)
             has_picking_flags = has_picking_scores >= self.has_picking_threshold
             picking_offsets = pred_offsets
