@@ -40,6 +40,7 @@ class PostProcessor(nn.Module):
         has_picking_threshold=0.5,
         point_offset_mode="center",
         point_top_anchor_ratio=0.0,
+        point_anchor_x_ratio=0.5,
         point_decode_clamp_x_abs=None,
         point_decode_clamp_y_min=None,
         point_decode_clamp_y_max=None,
@@ -54,6 +55,7 @@ class PostProcessor(nn.Module):
         self.has_picking_threshold = float(has_picking_threshold)
         self.point_offset_mode = str(point_offset_mode)
         self.point_top_anchor_ratio = float(point_top_anchor_ratio)
+        self.point_anchor_x_ratio = float(point_anchor_x_ratio)
         self.point_decode_clamp_x_abs = None if point_decode_clamp_x_abs is None else float(point_decode_clamp_x_abs)
         self.point_decode_clamp_y_min = None if point_decode_clamp_y_min is None else float(point_decode_clamp_y_min)
         self.point_decode_clamp_y_max = None if point_decode_clamp_y_max is None else float(point_decode_clamp_y_max)
@@ -80,6 +82,8 @@ class PostProcessor(nn.Module):
         has_picking_flags = None
         picking_points = None
         picking_offsets = None
+        point_quality_scores = None
+        point_final_scores = None
 
         if self.use_focal_loss:
             scores = F.sigmoid(logits)
@@ -112,6 +116,7 @@ class PostProcessor(nn.Module):
         if self.use_picking_point and 'pred_has_picking' in outputs and 'pred_picking_offsets' in outputs:
             pred_has_picking = outputs['pred_has_picking']
             pred_offsets = outputs['pred_picking_offsets']
+            pred_point_quality = outputs.get('pred_point_quality')
 
             # Keep point outputs aligned with the same top-k grape queries used
             # for labels/scores/boxes.
@@ -124,6 +129,11 @@ class PostProcessor(nn.Module):
                     dim=1,
                     index=index.unsqueeze(-1).repeat(1, 1, pred_offsets.shape[-1]),
                 )
+                if pred_point_quality is not None:
+                    pred_point_quality = pred_point_quality.gather(
+                        dim=1,
+                        index=index.unsqueeze(-1).repeat(1, 1, pred_point_quality.shape[-1]),
+                    )
 
             if any(v is not None for v in (self.point_decode_clamp_x_abs, self.point_decode_clamp_y_min, self.point_decode_clamp_y_max)):
                 pred_offsets = pred_offsets.clone()
@@ -144,14 +154,17 @@ class PostProcessor(nn.Module):
                     pred_offsets.to(torch.float32),
                     mode=self.point_offset_mode,
                     top_anchor_ratio=self.point_top_anchor_ratio,
+                    anchor_x_ratio=self.point_anchor_x_ratio,
                 )
-            # Decode every retained query into an image-coordinate candidate
-            # point; has_picking then marks which candidates are valid.
+            # Decode bbox-normalized picking_offset into a 2D image-coordinate
+            # picking_point for every retained query; has_picking then marks
+            # which candidate points are valid.
             picking_points = absolute_points_from_boxes_and_offsets(
                 abs_boxes_cxcywh,
                 pred_offsets,
                 mode=self.point_offset_mode,
                 top_anchor_ratio=self.point_top_anchor_ratio,
+                anchor_x_ratio=self.point_anchor_x_ratio,
             )
             picking_points = clamp_points_to_image(picking_points, orig_target_sizes)
 
@@ -161,6 +174,9 @@ class PostProcessor(nn.Module):
             has_picking_scores = F.sigmoid(pred_has_picking).squeeze(-1)
             has_picking_flags = has_picking_scores >= self.has_picking_threshold
             picking_offsets = pred_offsets
+            if pred_point_quality is not None:
+                point_quality_scores = F.sigmoid(pred_point_quality).squeeze(-1)
+                point_final_scores = has_picking_scores * point_quality_scores
 
         # TODO for onnx export
         if self.deploy_mode:
@@ -175,14 +191,24 @@ class PostProcessor(nn.Module):
         results = []
         zipped = zip(labels, boxes, scores)
         if has_picking_scores is not None:
-            zipped = zip(labels, boxes, scores, has_picking_scores, has_picking_flags, picking_points, picking_offsets)
+            zipped = zip(
+                labels,
+                boxes,
+                scores,
+                has_picking_scores,
+                has_picking_flags,
+                picking_points,
+                picking_offsets,
+                point_quality_scores if point_quality_scores is not None else [None] * len(labels),
+                point_final_scores if point_final_scores is not None else [None] * len(labels),
+            )
 
         for items in zipped:
             if has_picking_scores is None:
                 lab, box, sco = items
                 result = dict(labels=lab, boxes=box, scores=sco)
             else:
-                lab, box, sco, has_score, has_flag, point_xy, offset_xy = items
+                lab, box, sco, has_score, has_flag, point_xy, offset_xy, quality_score, final_score = items
                 result = dict(
                     labels=lab,
                     boxes=box,
@@ -192,6 +218,10 @@ class PostProcessor(nn.Module):
                     picking_points=point_xy,
                     picking_offsets=offset_xy,
                 )
+                if quality_score is not None:
+                    result["point_quality_scores"] = quality_score
+                if final_score is not None:
+                    result["point_final_scores"] = final_score
             results.append(result)
 
         return results

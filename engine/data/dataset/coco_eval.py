@@ -338,7 +338,8 @@ class GrapePointEvaluator(CocoEvaluator):
         sum_abs_y = sum(float(item["sum_abs_y"]) for item in self.point_records)
         sum_l2 = sum(float(item["sum_l2"]) for item in self.point_records)
 
-        # has_picking F1 evaluates the visibility decision on matched grapes.
+        # has_picking F1 evaluates the visible-picking-point decision on
+        # IoU-matched grape instances.
         precision = float(correct_visible / predicted_visible) if predicted_visible > 0 else 0.0
         recall = float(correct_visible / matched_visible_grapes) if matched_visible_grapes > 0 else 0.0
         f1 = 0.0 if precision + recall == 0 else float(2 * precision * recall / (precision + recall))
@@ -352,8 +353,9 @@ class GrapePointEvaluator(CocoEvaluator):
             "has_picking_f1": f1,
             "has_picking_false_positive": false_visible,
             "has_picking_false_negative": missed_visible,
-            # point_pair_count is the number of matched grapes where both GT
-            # and prediction are visible; L2 and |dy| are averaged over it.
+            # point_pair_count counts matched grapes where both GT and
+            # prediction are visible. mean L2 is the image-plane Euclidean
+            # point error, and |dy| is the absolute vertical point error.
             "point_pair_count": point_pairs,
             "point_mae_x_px": float(sum_abs_x / point_pairs) if point_pairs > 0 else 0.0,
             "point_mae_y_px": float(sum_abs_y / point_pairs) if point_pairs > 0 else 0.0,

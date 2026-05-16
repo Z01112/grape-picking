@@ -348,6 +348,10 @@ class TransformerDecoder(nn.Module):
         output_detach = pred_corners_undetach = 0
         value = self.value_op(memory, None, None, memory_mask, spatial_shapes)
 
+        # Legacy interface kept for backward compatibility; current GPPoint-DETR
+        # point outputs are computed in outer DFINETransformer.forward via
+        # _predict_point_branch. The picking_head arguments and dec_out_picking
+        # return slots are intentionally left as legacy placeholders here.
         dec_out_bboxes = []
         dec_out_logits = []
         dec_out_picking_logits = []
@@ -449,6 +453,9 @@ class DFINETransformer(nn.Module):
                  use_picking_point_head=False,
                  has_picking_head_layers=1,
                  picking_offset_head_layers=3,
+                 use_point_quality_head=False,
+                 point_quality_head_layers=2,
+                 point_quality_detach_input=False,
                  point_head_hidden_scale=1.0,
                  point_local_feature_fusion=False,
                  point_instance_binding_mode='legacy',
@@ -468,6 +475,13 @@ class DFINETransformer(nn.Module):
                  point_offset_activation='identity',
                  point_offset_min=-0.25,
                  point_offset_max=1.25,
+                 point_teacher_roi_mode='none',
+                 point_teacher_roi_apply_to='dn_only',
+                 point_teacher_roi_detach=True,
+                 point_decoupled_roi=False,
+                 point_offset_top_local_width_scale=1.08,
+                 point_offset_top_local_y_min_ratio=-0.20,
+                 point_offset_top_local_y_max_ratio=0.55,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -491,6 +505,9 @@ class DFINETransformer(nn.Module):
         self.use_picking_point_head = use_picking_point_head
         self.has_picking_head_layers = max(int(has_picking_head_layers), 1)
         self.picking_offset_head_layers = max(int(picking_offset_head_layers), 1)
+        self.use_point_quality_head = bool(use_point_quality_head)
+        self.point_quality_head_layers = max(int(point_quality_head_layers), 1)
+        self.point_quality_detach_input = bool(point_quality_detach_input)
         self.point_head_hidden_scale = float(point_head_hidden_scale)
         self.point_local_feature_fusion = bool(point_local_feature_fusion)
         self.point_instance_binding_mode = str(point_instance_binding_mode).strip().lower()
@@ -524,6 +541,17 @@ class DFINETransformer(nn.Module):
         self.point_offset_max = float(point_offset_max)
         if self.point_offset_max <= self.point_offset_min:
             self.point_offset_max = self.point_offset_min + 1.0
+        self.point_teacher_roi_mode = str(point_teacher_roi_mode).strip().lower()
+        if self.point_teacher_roi_mode not in ('none', 'dn_jitter'):
+            raise ValueError(f"Unsupported point_teacher_roi_mode: {point_teacher_roi_mode}")
+        self.point_teacher_roi_apply_to = str(point_teacher_roi_apply_to).strip().lower()
+        if self.point_teacher_roi_apply_to not in ('dn_only',):
+            raise ValueError(f"Unsupported point_teacher_roi_apply_to: {point_teacher_roi_apply_to}")
+        self.point_teacher_roi_detach = bool(point_teacher_roi_detach)
+        self.point_decoupled_roi = bool(point_decoupled_roi)
+        self.point_offset_top_local_width_scale = float(point_offset_top_local_width_scale)
+        self.point_offset_top_local_y_min_ratio = float(point_offset_top_local_y_min_ratio)
+        self.point_offset_top_local_y_max_ratio = float(point_offset_top_local_y_max_ratio)
         # GPPoint-DETR keeps the detector queries intact and changes only how
         # the per-query point feature is enriched before has/offset prediction.
         self.point_legacy_local_feature = self.point_instance_binding_mode == 'legacy' and self.point_local_feature_fusion
@@ -585,8 +613,10 @@ class DFINETransformer(nn.Module):
           + [nn.Linear(scaled_dim, num_classes) for _ in range(num_layers - self.eval_idx - 1)])
         self.dec_picking_head = None
         self.dec_picking_offset_head = None
+        self.dec_point_quality_head = None
         self.pre_picking_head = None
         self.pre_picking_offset_head = None
+        self.pre_point_quality_head = None
         self.dec_point_local_proj = None
         self.pre_point_local_proj = None
         self.dec_point_full_local_proj = None
@@ -602,8 +632,9 @@ class DFINETransformer(nn.Module):
         self.dec_point_fusion_head = None
         self.pre_point_fusion_head = None
         if self.use_picking_point_head:
-            # Per-query picking heads: one binary visible-point logit and one
-            # 2-D normalized offset for each decoder query.
+            # Per-grape-query picking heads: has_picking classifies whether the
+            # matched grape has a visible picking point, while point_offset
+            # regresses a bbox-normalized displacement from the top-center anchor.
             point_hidden_dim = max(int(round(hidden_dim * self.point_head_hidden_scale)), 1)
             point_hidden_dim_scaled = max(int(round(scaled_dim * self.point_head_hidden_scale)), 1)
             self.dec_picking_head = nn.ModuleList(
@@ -640,6 +671,24 @@ class DFINETransformer(nn.Module):
                 self.picking_offset_head_layers,
                 mlp_act,
             )
+            if self.use_point_quality_head:
+                self.dec_point_quality_head = nn.ModuleList(
+                    [
+                        self._make_point_head(hidden_dim, point_hidden_dim, 1, self.point_quality_head_layers, mlp_act)
+                        for _ in range(self.eval_idx + 1)
+                    ]
+                  + [
+                        self._make_point_head(scaled_dim, point_hidden_dim_scaled, 1, self.point_quality_head_layers, mlp_act)
+                        for _ in range(num_layers - self.eval_idx - 1)
+                    ]
+                )
+                self.pre_point_quality_head = self._make_point_head(
+                    hidden_dim,
+                    point_hidden_dim,
+                    1,
+                    self.point_quality_head_layers,
+                    mlp_act,
+                )
             if self.point_legacy_local_feature:
                 self.pre_point_local_proj = nn.Linear(hidden_dim, hidden_dim)
                 self.dec_point_local_proj = nn.ModuleList(
@@ -746,6 +795,10 @@ class DFINETransformer(nn.Module):
                     for i in range(len(self.dec_picking_offset_head))
                 ]
             )
+        if self.dec_point_quality_head is not None:
+            self.dec_point_quality_head = nn.ModuleList(
+                [nn.Identity()] * (self.eval_idx) + [self.dec_point_quality_head[self.eval_idx]]
+            )
 
     @staticmethod
     def _make_point_head(input_dim, hidden_dim, output_dim, num_layers, act):
@@ -830,19 +883,31 @@ class DFINETransformer(nn.Module):
         y2 = torch.maximum(y2.clamp(min=0.0, max=float(feat_h)), y1 + 1e-3)
         return torch.stack((x1, y1, x2, y2), dim=-1)
 
-    def _build_point_top_rois(self, boxes_cxcywh: torch.Tensor, feat_h: int, feat_w: int) -> torch.Tensor:
+    def _build_point_top_rois(
+        self,
+        boxes_cxcywh: torch.Tensor,
+        feat_h: int,
+        feat_w: int,
+        width_scale: float = None,
+        y_min_ratio: float = None,
+        y_max_ratio: float = None,
+    ) -> torch.Tensor:
         """Build the Top Local ROI used by the GPPoint-DETR point branch.
 
         The input boxes are normalized cxcywh query boxes. The ROI is centered
         horizontally on the query box but vertically expressed relative to the
         top edge, matching the paper's upper-peduncle local cue.
+        This is a fixed geometric-prior window, not an adaptive search module.
         """
         boxes = boxes_cxcywh.to(torch.float32)
         cx, cy, w, h = boxes.unbind(-1)
-        roi_w = (w * self.point_top_local_width_scale).clamp(min=1e-6)
+        width_scale = self.point_top_local_width_scale if width_scale is None else float(width_scale)
+        y_min_ratio = self.point_top_local_y_min_ratio if y_min_ratio is None else float(y_min_ratio)
+        y_max_ratio = self.point_top_local_y_max_ratio if y_max_ratio is None else float(y_max_ratio)
+        roi_w = (w * width_scale).clamp(min=1e-6)
         top_y = cy - 0.5 * h
-        y1 = (top_y + self.point_top_local_y_min_ratio * h) * feat_h
-        y2 = (top_y + self.point_top_local_y_max_ratio * h) * feat_h
+        y1 = (top_y + y_min_ratio * h) * feat_h
+        y2 = (top_y + y_max_ratio * h) * feat_h
         x1 = (cx - 0.5 * roi_w) * feat_w
         x2 = (cx + 0.5 * roi_w) * feat_w
         x1 = x1.clamp(min=0.0, max=max(float(feat_w - 1), 0.0))
@@ -851,7 +916,13 @@ class DFINETransformer(nn.Module):
         y2 = torch.maximum(y2.clamp(min=0.0, max=float(feat_h)), y1 + 1e-3)
         return torch.stack((x1, y1, x2, y2), dim=-1)
 
-    def _pool_point_local_features(self, proj_feats: List[torch.Tensor], boxes_cxcywh: torch.Tensor, roi_type: str = 'legacy') -> torch.Tensor:
+    def _pool_point_local_features(
+        self,
+        proj_feats: List[torch.Tensor],
+        boxes_cxcywh: torch.Tensor,
+        roi_type: str = 'legacy',
+        top_roi_params: tuple = None,
+    ) -> torch.Tensor:
         level_idx = min(self.point_local_feature_level, len(proj_feats) - 1)
         feat = proj_feats[level_idx]
         bs, _, feat_h, feat_w = feat.shape
@@ -865,7 +936,10 @@ class DFINETransformer(nn.Module):
         elif roi_type == 'full':
             rois_xyxy = self._build_full_local_rois(boxes_cxcywh, feat_h, feat_w)
         elif roi_type == 'top':
-            rois_xyxy = self._build_point_top_rois(boxes_cxcywh, feat_h, feat_w)
+            if top_roi_params is None:
+                rois_xyxy = self._build_point_top_rois(boxes_cxcywh, feat_h, feat_w)
+            else:
+                rois_xyxy = self._build_point_top_rois(boxes_cxcywh, feat_h, feat_w, *top_roi_params)
         else:
             raise ValueError(f"Unsupported roi_type: {roi_type}")
         batch_ids = torch.arange(bs, device=feat.device, dtype=rois_xyxy.dtype).view(bs, 1, 1).expand(bs, query_count, 1)
@@ -892,6 +966,8 @@ class DFINETransformer(nn.Module):
         query_pos_proj_head,
         box_geom_proj_head,
         fusion_head,
+        roi_boxes_cxcywh: torch.Tensor = None,
+        top_roi_params: tuple = None,
     ) -> torch.Tensor:
         """Fuse query, box geometry, and optional local cues for point heads.
 
@@ -899,16 +975,24 @@ class DFINETransformer(nn.Module):
         evidence, query positional embedding, and predicted-box geometry. The
         fused feature is still tied to the same object query, not a new ROI
         detector proposal.
+        Conceptually these are query semantic, local visual cue, and geometric
+        prior signals.
         """
         parts = [hidden]
+        local_boxes_cxcywh = boxes_cxcywh if roi_boxes_cxcywh is None else roi_boxes_cxcywh
         if legacy_local_proj_head is not None:
-            legacy_local_feat = self._pool_point_local_features(proj_feats, boxes_cxcywh, roi_type='legacy')
+            legacy_local_feat = self._pool_point_local_features(proj_feats, local_boxes_cxcywh, roi_type='legacy')
             parts.append(legacy_local_proj_head(legacy_local_feat))
         if full_local_proj_head is not None:
-            full_local_feat = self._pool_point_local_features(proj_feats, boxes_cxcywh, roi_type='full')
+            full_local_feat = self._pool_point_local_features(proj_feats, local_boxes_cxcywh, roi_type='full')
             parts.append(full_local_proj_head(full_local_feat))
         if top_local_proj_head is not None:
-            top_local_feat = self._pool_point_local_features(proj_feats, boxes_cxcywh, roi_type='top')
+            top_local_feat = self._pool_point_local_features(
+                proj_feats,
+                local_boxes_cxcywh,
+                roi_type='top',
+                top_roi_params=top_roi_params,
+            )
             parts.append(top_local_proj_head(top_local_feat))
         if size_proj_head is not None:
             parts.append(size_proj_head(self._box_geometry_features(boxes_cxcywh)))
@@ -928,6 +1012,7 @@ class DFINETransformer(nn.Module):
         proj_feats: List[torch.Tensor],
         cls_head,
         offset_head,
+        quality_head,
         legacy_local_proj_head,
         full_local_proj_head,
         top_local_proj_head,
@@ -935,9 +1020,10 @@ class DFINETransformer(nn.Module):
         query_pos_proj_head,
         box_geom_proj_head,
         fusion_head,
+        roi_boxes_cxcywh: torch.Tensor = None,
     ):
-        """Predict per-query has_picking logits and point offsets."""
-        point_feature = self._fuse_point_feature(
+        """Predict per-query has_picking logits, point offsets, and optional quality."""
+        cls_feature = self._fuse_point_feature(
             hidden,
             boxes_cxcywh,
             proj_feats,
@@ -948,8 +1034,56 @@ class DFINETransformer(nn.Module):
             query_pos_proj_head,
             box_geom_proj_head,
             fusion_head,
+            roi_boxes_cxcywh,
         )
-        return cls_head(point_feature), self._activate_point_offsets(offset_head(point_feature))
+        if self.point_decoupled_roi and top_local_proj_head is not None:
+            # v7_exp2_decoupled_roi keeps has_picking on the current narrow Top
+            # ROI while giving point_offset a taller Top ROI.  This changes
+            # only local visual cue pooling; query semantics, box geometry,
+            # losses, and postprocess decoding stay unchanged.
+            offset_feature = self._fuse_point_feature(
+                hidden,
+                boxes_cxcywh,
+                proj_feats,
+                legacy_local_proj_head,
+                full_local_proj_head,
+                top_local_proj_head,
+                size_proj_head,
+                query_pos_proj_head,
+                box_geom_proj_head,
+                fusion_head,
+                roi_boxes_cxcywh,
+                (
+                    self.point_offset_top_local_width_scale,
+                    self.point_offset_top_local_y_min_ratio,
+                    self.point_offset_top_local_y_max_ratio,
+                ),
+            )
+        else:
+            offset_feature = cls_feature
+        if quality_head is not None:
+            # v7_exp2_point_quality_sg uses the same quality target as the
+            # original point_quality ablation, but stops quality-loss gradients
+            # from flowing back into the shared query/ROI/point features.
+            quality_feature = offset_feature.detach() if self.point_quality_detach_input else offset_feature
+            quality_logits = quality_head(quality_feature)
+        else:
+            quality_logits = None
+        return cls_head(cls_feature), self._activate_point_offsets(offset_head(offset_feature)), quality_logits
+
+    def _get_dn_teacher_roi_boxes(self, denoising_bbox_unact: torch.Tensor, dn_meta: dict) -> torch.Tensor:
+        if (
+            self.point_teacher_roi_mode != 'dn_jitter'
+            or self.point_teacher_roi_apply_to != 'dn_only'
+            or denoising_bbox_unact is None
+            or dn_meta is None
+        ):
+            return None
+        # DN inputs are target boxes with denoising jitter already applied.  Use
+        # them only as the local-ROI pooling box; decoder box geometry and losses
+        # keep their original GPPoint-DETR behavior.
+        boxes = denoising_bbox_unact.sigmoid()
+        return boxes.detach() if self.point_teacher_roi_detach else boxes
 
     def _reset_parameters(self, feat_channels):
         bias = bias_init_with_prob(0.01)
@@ -963,6 +1097,8 @@ class DFINETransformer(nn.Module):
             self._init_cls_head_bias(self.pre_picking_head, bias)
         if self.pre_picking_offset_head is not None:
             self._init_reg_head_zero(self.pre_picking_offset_head)
+        if self.pre_point_quality_head is not None:
+            self._init_reg_head_zero(self.pre_point_quality_head)
         if self.pre_point_fusion_head is not None:
             self._init_reg_head_zero(self.pre_point_fusion_head)
 
@@ -976,6 +1112,9 @@ class DFINETransformer(nn.Module):
                 self._init_cls_head_bias(head, bias)
         if self.dec_picking_offset_head is not None:
             for head in self.dec_picking_offset_head:
+                self._init_reg_head_zero(head)
+        if self.dec_point_quality_head is not None:
+            for head in self.dec_point_quality_head:
                 self._init_reg_head_zero(head)
         if self.dec_point_fusion_head is not None:
             for head in self.dec_point_fusion_head:
@@ -1163,6 +1302,7 @@ class DFINETransformer(nn.Module):
 
         init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
+        dn_teacher_roi_boxes = self._get_dn_teacher_roi_boxes(denoising_bbox_unact, dn_meta)
 
         # decoder
         out_bboxes, out_logits, out_picking_logits, out_picking_offsets, out_corners, out_refs, \
@@ -1208,12 +1348,13 @@ class DFINETransformer(nn.Module):
             dn_out_hidden = None
 
         if self.use_picking_point_head:
-            pre_picking_logits, pre_picking_offsets = self._predict_point_branch(
+            pre_picking_logits, pre_picking_offsets, pre_point_quality_logits = self._predict_point_branch(
                 pre_hidden,
                 pre_bboxes,
                 proj_feats,
                 self.pre_picking_head,
                 self.pre_picking_offset_head,
+                self.pre_point_quality_head,
                 self.pre_point_local_proj,
                 self.pre_point_full_local_proj,
                 self.pre_point_top_local_proj,
@@ -1225,13 +1366,15 @@ class DFINETransformer(nn.Module):
 
             out_picking_logits_list = []
             out_picking_offsets_list = []
+            out_point_quality_logits_list = []
             for layer_idx in range(out_hidden.shape[0]):
-                logits_i, offsets_i = self._predict_point_branch(
+                logits_i, offsets_i, quality_i = self._predict_point_branch(
                     out_hidden[layer_idx],
                     out_bboxes[layer_idx],
                     proj_feats,
                     self.dec_picking_head[layer_idx],
                     self.dec_picking_offset_head[layer_idx],
+                    self.dec_point_quality_head[layer_idx] if self.dec_point_quality_head is not None else None,
                     self.dec_point_local_proj[layer_idx] if self.dec_point_local_proj is not None else None,
                     self.dec_point_full_local_proj[layer_idx] if self.dec_point_full_local_proj is not None else None,
                     self.dec_point_top_local_proj[layer_idx] if self.dec_point_top_local_proj is not None else None,
@@ -1242,19 +1385,24 @@ class DFINETransformer(nn.Module):
                 )
                 out_picking_logits_list.append(logits_i)
                 out_picking_offsets_list.append(offsets_i)
+                if quality_i is not None:
+                    out_point_quality_logits_list.append(quality_i)
             out_picking_logits = torch.stack(out_picking_logits_list) if out_picking_logits_list else None
             out_picking_offsets = torch.stack(out_picking_offsets_list) if out_picking_offsets_list else None
+            out_point_quality_logits = torch.stack(out_point_quality_logits_list) if out_point_quality_logits_list else None
 
             if dn_out_hidden is not None:
                 dn_out_picking_logits_list = []
                 dn_out_picking_offsets_list = []
+                dn_out_point_quality_logits_list = []
                 for layer_idx in range(dn_out_hidden.shape[0]):
-                    logits_i, offsets_i = self._predict_point_branch(
+                    logits_i, offsets_i, quality_i = self._predict_point_branch(
                         dn_out_hidden[layer_idx],
                         dn_out_bboxes[layer_idx],
                         proj_feats,
                         self.dec_picking_head[layer_idx],
                         self.dec_picking_offset_head[layer_idx],
+                        self.dec_point_quality_head[layer_idx] if self.dec_point_quality_head is not None else None,
                         self.dec_point_local_proj[layer_idx] if self.dec_point_local_proj is not None else None,
                         self.dec_point_full_local_proj[layer_idx] if self.dec_point_full_local_proj is not None else None,
                         self.dec_point_top_local_proj[layer_idx] if self.dec_point_top_local_proj is not None else None,
@@ -1262,21 +1410,26 @@ class DFINETransformer(nn.Module):
                         self.dec_point_query_pos_proj[layer_idx] if self.dec_point_query_pos_proj is not None else None,
                         self.dec_point_box_geom_proj[layer_idx] if self.dec_point_box_geom_proj is not None else None,
                         self.dec_point_fusion_head[layer_idx] if self.dec_point_fusion_head is not None else None,
+                        roi_boxes_cxcywh=dn_teacher_roi_boxes,
                     )
                     dn_out_picking_logits_list.append(logits_i)
                     dn_out_picking_offsets_list.append(offsets_i)
+                    if quality_i is not None:
+                        dn_out_point_quality_logits_list.append(quality_i)
                 dn_out_picking_logits = torch.stack(dn_out_picking_logits_list) if dn_out_picking_logits_list else None
                 dn_out_picking_offsets = torch.stack(dn_out_picking_offsets_list) if dn_out_picking_offsets_list else None
+                dn_out_point_quality_logits = torch.stack(dn_out_point_quality_logits_list) if dn_out_point_quality_logits_list else None
             else:
-                dn_out_picking_logits, dn_out_picking_offsets = None, None
+                dn_out_picking_logits, dn_out_picking_offsets, dn_out_point_quality_logits = None, None, None
 
             if dn_pre_hidden is not None:
-                dn_pre_picking_logits, dn_pre_picking_offsets = self._predict_point_branch(
+                dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits = self._predict_point_branch(
                     dn_pre_hidden,
                     dn_pre_bboxes,
                     proj_feats,
                     self.pre_picking_head,
                     self.pre_picking_offset_head,
+                    self.pre_point_quality_head,
                     self.pre_point_local_proj,
                     self.pre_point_full_local_proj,
                     self.pre_point_top_local_proj,
@@ -1284,15 +1437,17 @@ class DFINETransformer(nn.Module):
                     self.pre_point_query_pos_proj,
                     self.pre_point_box_geom_proj,
                     self.pre_point_fusion_head,
+                    roi_boxes_cxcywh=dn_teacher_roi_boxes,
                 )
             else:
-                dn_pre_picking_logits, dn_pre_picking_offsets = None, None
+                dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits = None, None, None
         else:
             out_picking_logits = None
             out_picking_offsets = None
-            dn_out_picking_logits, dn_out_picking_offsets = None, None
-            pre_picking_logits, pre_picking_offsets = None, None
-            dn_pre_picking_logits, dn_pre_picking_offsets = None, None
+            out_point_quality_logits = None
+            dn_out_picking_logits, dn_out_picking_offsets, dn_out_point_quality_logits = None, None, None
+            pre_picking_logits, pre_picking_offsets, pre_point_quality_logits = None, None, None
+            dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits = None, None, None
 
 
         if self.training:
@@ -1304,6 +1459,8 @@ class DFINETransformer(nn.Module):
             # Final per-query outputs consumed by criterion and postprocessor.
             out['pred_has_picking'] = out_picking_logits[-1]
             out['pred_picking_offsets'] = out_picking_offsets[-1]
+            if out_point_quality_logits is not None:
+                out['pred_point_quality'] = out_point_quality_logits[-1]
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss2(
@@ -1315,12 +1472,15 @@ class DFINETransformer(nn.Module):
                 out_logits[-1],
                 out_picking_logits[:-1] if out_picking_logits is not None else None,
                 out_picking_offsets[:-1] if out_picking_offsets is not None else None,
+                out_point_quality_logits[:-1] if out_point_quality_logits is not None else None,
             )
             out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
             out['pre_outputs'] = {'pred_logits': pre_logits, 'pred_boxes': pre_bboxes}
             if pre_picking_logits is not None:
                 out['pre_outputs']['pred_has_picking'] = pre_picking_logits
                 out['pre_outputs']['pred_picking_offsets'] = pre_picking_offsets
+                if pre_point_quality_logits is not None:
+                    out['pre_outputs']['pred_point_quality'] = pre_point_quality_logits
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
 
             if dn_meta is not None:
@@ -1333,18 +1493,28 @@ class DFINETransformer(nn.Module):
                     dn_out_logits[-1],
                     dn_out_picking_logits,
                     dn_out_picking_offsets,
+                    dn_out_point_quality_logits,
                 )
                 out['dn_pre_outputs'] = {'pred_logits': dn_pre_logits, 'pred_boxes': dn_pre_bboxes}
                 if dn_pre_picking_logits is not None:
                     out['dn_pre_outputs']['pred_has_picking'] = dn_pre_picking_logits
                     out['dn_pre_outputs']['pred_picking_offsets'] = dn_pre_picking_offsets
+                    if dn_pre_point_quality_logits is not None:
+                        out['dn_pre_outputs']['pred_point_quality'] = dn_pre_point_quality_logits
                 out['dn_meta'] = dn_meta
 
         return out
 
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_picking_logits=None, outputs_picking_offsets=None):
+    def _set_aux_loss(
+        self,
+        outputs_class,
+        outputs_coord,
+        outputs_picking_logits=None,
+        outputs_picking_offsets=None,
+        outputs_point_quality_logits=None,
+    ):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
@@ -1355,6 +1525,8 @@ class DFINETransformer(nn.Module):
                 item['pred_has_picking'] = outputs_picking_logits[idx]
             if outputs_picking_offsets is not None:
                 item['pred_picking_offsets'] = outputs_picking_offsets[idx]
+            if outputs_point_quality_logits is not None:
+                item['pred_point_quality'] = outputs_point_quality_logits[idx]
             results.append(item)
         return results
 
@@ -1362,7 +1534,8 @@ class DFINETransformer(nn.Module):
     @torch.jit.unused
     def _set_aux_loss2(self, outputs_class, outputs_coord, outputs_corners, outputs_ref,
                        teacher_corners=None, teacher_logits=None,
-                       outputs_picking_logits=None, outputs_picking_offsets=None):
+                       outputs_picking_logits=None, outputs_picking_offsets=None,
+                       outputs_point_quality_logits=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
@@ -1380,5 +1553,7 @@ class DFINETransformer(nn.Module):
                 item['pred_has_picking'] = outputs_picking_logits[idx]
             if outputs_picking_offsets is not None:
                 item['pred_picking_offsets'] = outputs_picking_offsets[idx]
+            if outputs_point_quality_logits is not None:
+                item['pred_point_quality'] = outputs_point_quality_logits[idx]
             results.append(item)
         return results

@@ -17,6 +17,7 @@ import copy
 
 from .dfine_utils import bbox2distance
 from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
+from .point_utils import absolute_points_from_boxes_and_offsets
 from ..misc.dist_utils import get_world_size, is_dist_available_and_initialized
 from ..core import register
 
@@ -60,11 +61,14 @@ class RTv4Criterion(nn.Module):
                  top_region_ratio=0.35,
                  top_margin_ratio=0.12,
                  lambda_geo=0.0,
-                 point_locality_x_abs_max=1.0,
-                 point_locality_y_min=-1.0,
-                 point_locality_y_max=1.0,
-                 point_locality_power=2.0,
-                 ):
+                  point_locality_x_abs_max=1.0,
+                  point_locality_y_min=-1.0,
+                  point_locality_y_max=1.0,
+                  point_locality_power=2.0,
+                  point_quality_tau=30.0,
+                  point_quality_offset_mode='center',
+                  point_quality_top_anchor_ratio=0.0,
+                  ):
         """Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals.
@@ -111,6 +115,9 @@ class RTv4Criterion(nn.Module):
         self.point_locality_y_min = float(point_locality_y_min)
         self.point_locality_y_max = float(point_locality_y_max)
         self.point_locality_power = max(float(point_locality_power), 1.0)
+        self.point_quality_tau = max(float(point_quality_tau), 1e-6)
+        self.point_quality_offset_mode = str(point_quality_offset_mode)
+        self.point_quality_top_anchor_ratio = float(point_quality_top_anchor_ratio)
         if 'loss_dense_has_picking' not in self.weight_dict and self.lambda_dense_has > 0.0:
             self.weight_dict['loss_dense_has_picking'] = self.lambda_dense_has
         if 'loss_dense_picking_offset' not in self.weight_dict and self.lambda_dense_point > 0.0:
@@ -366,6 +373,8 @@ class RTv4Criterion(nn.Module):
         return src_offsets, target_has_picking, target_offsets, target_boxes
 
     def _collect_dense_positive_examples(self, outputs, targets, indices):
+        # Legacy experimental losses, not used by current baseline_replay /
+        # v7_exp2 / small_weight configs.
         if self._dense_positive_cache is not None:
             return self._dense_positive_cache
 
@@ -484,7 +493,68 @@ class RTv4Criterion(nn.Module):
         loss = (point_loss * sample_weights).sum() / max(int(valid.sum().item()), 1)
         return {'loss_picking_offset': loss}
 
+    def loss_point_quality(self, outputs, targets, indices, num_boxes, **kwargs):
+        """Quality calibration for visible matched picking points.
+
+        quality_target = exp(-detach(L2_pixel) / tau).  Detaching the L2 target
+        keeps this head as a reliability estimator while loss_picking_offset
+        remains the coordinate regression objective.
+        """
+        if 'pred_point_quality' not in outputs or 'pred_picking_offsets' not in outputs or 'pred_boxes' not in outputs:
+            return {}
+
+        idx = self._get_src_permutation_idx(indices)
+        src_quality_logits = outputs['pred_point_quality'][idx].squeeze(-1)
+        src_offsets = outputs['pred_picking_offsets'][idx]
+        src_boxes = outputs['pred_boxes'][idx]
+        if src_quality_logits.numel() == 0:
+            return {'loss_point_quality': outputs['pred_point_quality'].sum() * 0.0}
+
+        target_has_picking = torch.cat(
+            [t['has_picking'][j] for t, (_, j) in zip(targets, indices)],
+            dim=0,
+        ).to(dtype=src_quality_logits.dtype, device=src_quality_logits.device)
+        target_offsets = torch.cat(
+            [t['picking_offsets'][j] for t, (_, j) in zip(targets, indices)],
+            dim=0,
+        ).to(dtype=src_offsets.dtype, device=src_offsets.device)
+        target_boxes = torch.cat(
+            [t['boxes'][j] for t, (_, j) in zip(targets, indices)],
+            dim=0,
+        ).to(dtype=src_boxes.dtype, device=src_boxes.device)
+        target_sizes = torch.cat(
+            [
+                t['orig_size'].to(device=src_boxes.device, dtype=src_boxes.dtype).view(1, 2).repeat(len(j), 1)
+                for t, (_, j) in zip(targets, indices)
+            ],
+            dim=0,
+        )
+
+        valid = target_has_picking > 0.5
+        if not valid.any():
+            return {'loss_point_quality': outputs['pred_point_quality'].sum() * 0.0}
+
+        scale_xyxy = target_sizes[valid].repeat(1, 2)
+        pred_points = absolute_points_from_boxes_and_offsets(
+            src_boxes[valid] * scale_xyxy,
+            src_offsets[valid],
+            mode=self.point_quality_offset_mode,
+            top_anchor_ratio=self.point_quality_top_anchor_ratio,
+        )
+        target_points = absolute_points_from_boxes_and_offsets(
+            target_boxes[valid] * scale_xyxy,
+            target_offsets[valid],
+            mode=self.point_quality_offset_mode,
+            top_anchor_ratio=self.point_quality_top_anchor_ratio,
+        )
+        l2_pixel = torch.linalg.norm(pred_points - target_points, ord=2, dim=-1).detach()
+        quality_target = torch.exp(-l2_pixel / self.point_quality_tau).to(dtype=src_quality_logits.dtype)
+        loss = F.binary_cross_entropy_with_logits(src_quality_logits[valid], quality_target, reduction='mean')
+        return {'loss_point_quality': loss}
+
     def loss_dense_has_picking(self, outputs, targets, indices, num_boxes, **kwargs):
+        # Legacy experimental losses, not used by current baseline_replay /
+        # v7_exp2 / small_weight configs.
         if 'pred_has_picking' not in outputs or 'pred_picking_offsets' not in outputs:
             return {}
         dense = self._collect_dense_positive_examples(outputs, targets, indices)
@@ -498,6 +568,8 @@ class RTv4Criterion(nn.Module):
         return {'loss_dense_has_picking': loss}
 
     def loss_dense_picking_offset(self, outputs, targets, indices, num_boxes, **kwargs):
+        # Legacy experimental losses, not used by current baseline_replay /
+        # v7_exp2 / small_weight configs.
         if 'pred_picking_offsets' not in outputs:
             return {}
         dense = self._collect_dense_positive_examples(outputs, targets, indices)
@@ -532,6 +604,8 @@ class RTv4Criterion(nn.Module):
         return penalty.pow(2.0).sum(dim=-1)
 
     def loss_picking_geo(self, outputs, targets, indices, num_boxes, **kwargs):
+        # Legacy experimental losses, not used by current baseline_replay /
+        # v7_exp2 / small_weight configs.
         if 'pred_picking_offsets' not in outputs:
             return {}
 
@@ -558,6 +632,8 @@ class RTv4Criterion(nn.Module):
         return {'loss_picking_geo': loss}
 
     def loss_picking_locality(self, outputs, targets, indices, num_boxes, **kwargs):
+        # Legacy experimental losses, not used by current baseline_replay /
+        # v7_exp2 / small_weight configs.
         if 'pred_picking_offsets' not in outputs:
             return {}
 
@@ -652,10 +728,7 @@ class RTv4Criterion(nn.Module):
             'local': self.loss_local,
             'has_picking': self.loss_has_picking,
             'picking_offset': self.loss_picking_offset,
-            'dense_has_picking': self.loss_dense_has_picking,
-            'dense_picking_offset': self.loss_dense_picking_offset,
-            'picking_geo': self.loss_picking_geo,
-            'picking_locality': self.loss_picking_locality,
+            'point_quality': self.loss_point_quality,
             'distill': self.loss_distillation,  # NEW: Add distillation loss
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
@@ -708,7 +781,7 @@ class RTv4Criterion(nn.Module):
 
         # Compute all the requested losses, main loss
         losses = {}
-        main_only_losses = {'dense_has_picking', 'dense_picking_offset', 'picking_geo'}
+        main_only_losses = set()
         for loss_name in self.losses:
             # TODO, indices and num_box are different from RT-DETRv2
             if loss_name == 'distill':

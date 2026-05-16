@@ -1,0 +1,14 @@
+__include__: [
+  './rtv4_hgnetv2_s_grape_point_v7_exp2.yml'
+]
+
+output_dir: ./outputs/grape_point_v7_exp2_decoupled_roi
+
+DFINETransformer:
+  point_decoupled_roi: True
+  # has_picking keeps the inherited current Top ROI:
+  # width_scale=1.08, y_min=-0.10, y_max=0.40.
+  # point_offset alone uses this taller Top ROI.
+  point_offset_top_local_width_scale: 1.08
+  point_offset_top_local_y_min_ratio: -0.20
+  point_offset_top_local_y_max_ratio: 0.55

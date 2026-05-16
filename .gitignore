@@ -56,3 +56,6 @@ wandb/
 # Data/cache-like
 *.cache
 *.pkl
+
+/_archive_cleanup/
+/docs/

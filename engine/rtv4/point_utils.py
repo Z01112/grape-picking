@@ -31,18 +31,19 @@ def _point_anchor_from_xywh_bbox(
     box_xywh: Iterable[float],
     mode: str = "center",
     top_anchor_ratio: float = 0.0,
+    anchor_x_ratio: float = 0.5,
 ) -> list[float]:
     """Return the reference anchor used to encode a picking point.
 
-    top_center uses the horizontal box center and a y position measured from
-    the top edge: y_top + top_anchor_ratio * h. This is the geometric prior
-    described in the paper.
+    top_center uses a width-relative x anchor and a y position measured from
+    the top edge: y_top + top_anchor_ratio * h. The default x ratio is 0.5,
+    preserving the original upper-center grape-picking prior.
     """
     x, y, w, h = [float(v) for v in box_xywh]
     mode = _normalize_point_offset_mode(mode)
     if mode == "bbox_relative":
         return [x, y]
-    center_x = x + 0.5 * w
+    center_x = x + float(anchor_x_ratio) * w
     if mode == "center":
         anchor_y = y + 0.5 * h
     else:
@@ -55,6 +56,7 @@ def offset_from_xywh_bbox(
     point_xy: Iterable[float],
     mode: str = "center",
     top_anchor_ratio: float = 0.0,
+    anchor_x_ratio: float = 0.5,
 ) -> list[float]:
     """Encode an absolute point as a width/height-normalized offset."""
     px, py = [float(v) for v in point_xy]
@@ -62,6 +64,7 @@ def offset_from_xywh_bbox(
         box_xywh,
         mode=mode,
         top_anchor_ratio=top_anchor_ratio,
+        anchor_x_ratio=anchor_x_ratio,
     )
     x, y, w, h = [float(v) for v in box_xywh]
     return [
@@ -75,6 +78,7 @@ def absolute_points_from_boxes_and_offsets(
     offsets_xy: torch.Tensor,
     mode: str = "center",
     top_anchor_ratio: float = 0.0,
+    anchor_x_ratio: float = 0.5,
 ) -> torch.Tensor:
     """Decode normalized offsets into image-coordinate picking points.
 
@@ -89,6 +93,7 @@ def absolute_points_from_boxes_and_offsets(
         centers[..., 0] = boxes_cxcywh[..., 0] - 0.5 * boxes_cxcywh[..., 2]
         centers[..., 1] = boxes_cxcywh[..., 1] - 0.5 * boxes_cxcywh[..., 3]
     elif mode == "top_center":
+        centers[..., 0] = boxes_cxcywh[..., 0] - 0.5 * boxes_cxcywh[..., 2] + float(anchor_x_ratio) * boxes_cxcywh[..., 2]
         centers[..., 1] = boxes_cxcywh[..., 1] - 0.5 * boxes_cxcywh[..., 3] + float(top_anchor_ratio) * boxes_cxcywh[..., 3]
     sizes = boxes_cxcywh[..., 2:].clamp(min=1e-6)
     return centers + offsets_xy * sizes
@@ -109,6 +114,7 @@ def normalized_offsets_from_boxes_and_points(
     points_xy: torch.Tensor,
     mode: str = "center",
     top_anchor_ratio: float = 0.0,
+    anchor_x_ratio: float = 0.5,
 ) -> torch.Tensor:
     """Generate training targets matching absolute_points_from_boxes_and_offsets."""
     boxes_cxcywh = boxes_cxcywh.to(torch.float32)
@@ -119,6 +125,7 @@ def normalized_offsets_from_boxes_and_points(
         centers[..., 0] = boxes_cxcywh[..., 0] - 0.5 * boxes_cxcywh[..., 2]
         centers[..., 1] = boxes_cxcywh[..., 1] - 0.5 * boxes_cxcywh[..., 3]
     elif mode == "top_center":
+        centers[..., 0] = boxes_cxcywh[..., 0] - 0.5 * boxes_cxcywh[..., 2] + float(anchor_x_ratio) * boxes_cxcywh[..., 2]
         centers[..., 1] = boxes_cxcywh[..., 1] - 0.5 * boxes_cxcywh[..., 3] + float(top_anchor_ratio) * boxes_cxcywh[..., 3]
     sizes = boxes_cxcywh[..., 2:].clamp(min=1e-6)
     return (points_xy - centers) / sizes
@@ -130,18 +137,21 @@ def assert_offset_roundtrip(
     atol: float = 1e-5,
     mode: str = "center",
     top_anchor_ratio: float = 0.0,
+    anchor_x_ratio: float = 0.5,
 ) -> None:
     points = absolute_points_from_boxes_and_offsets(
         boxes_cxcywh,
         offsets_xy,
         mode=mode,
         top_anchor_ratio=top_anchor_ratio,
+        anchor_x_ratio=anchor_x_ratio,
     )
     restored = normalized_offsets_from_boxes_and_points(
         boxes_cxcywh,
         points,
         mode=mode,
         top_anchor_ratio=top_anchor_ratio,
+        anchor_x_ratio=anchor_x_ratio,
     )
     if not torch.allclose(offsets_xy.to(torch.float32), restored, atol=atol, rtol=0.0):
         raise AssertionError("Point offset round-trip validation failed.")

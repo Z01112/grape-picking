@@ -1,0 +1,11 @@
+# Project-scoped Codex settings for long GPPoint-DETR sessions.
+# Keep this conservative: do not override model_context_window, because custom
+# context-window values have been linked to auto-compaction failures upstream.
+
+model_reasoning_effort = "high"
+model_verbosity = "low"
+
+# Trigger compaction before the conversation gets extremely large. This does
+# not fix backend reconnect issues by itself, but keeps compact payloads smaller
+# for long experiment/debug sessions.
+model_auto_compact_token_limit = 180000

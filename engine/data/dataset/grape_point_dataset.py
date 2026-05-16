@@ -32,6 +32,7 @@ class GrapePointCocoDetection(CocoDetection):
         regenerate_point_offsets=False,
         point_offset_mode="center",
         point_top_anchor_ratio=0.0,
+        point_anchor_x_ratio=0.5,
     ):
         super().__init__(
             img_folder=img_folder,
@@ -43,6 +44,7 @@ class GrapePointCocoDetection(CocoDetection):
         self.regenerate_point_offsets = bool(regenerate_point_offsets)
         self.point_offset_mode = str(point_offset_mode)
         self.point_top_anchor_ratio = float(point_top_anchor_ratio)
+        self.point_anchor_x_ratio = float(point_anchor_x_ratio)
 
     def __getitem__(self, idx):
         image, target = super().load_item(idx)
@@ -83,6 +85,7 @@ class GrapePointCocoDetection(CocoDetection):
             points,
             mode=self.point_offset_mode,
             top_anchor_ratio=self.point_top_anchor_ratio,
+            anchor_x_ratio=self.point_anchor_x_ratio,
         )
         offsets = torch.where((has_picking > 0.5).unsqueeze(-1), offsets, torch.zeros_like(offsets))
         target["picking_offsets"] = offsets
