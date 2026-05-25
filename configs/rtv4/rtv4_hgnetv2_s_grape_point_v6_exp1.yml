@@ -1,9 +1,0 @@
-__include__: [
-  './rtv4_hgnetv2_s_grape_point_v6_common.yml'
-]
-
-output_dir: ./outputs/grape_point_v6_exp1_instance_binding
-
-DFINETransformer:
-  point_instance_binding_mode: query_box
-

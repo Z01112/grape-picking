@@ -1,5 +1,238 @@
-__include__: [
-  './rtv4_hgnetv2_s_grape_point_v7_exp2.yml'
-]
+# Current main model: v7_exp2 (query_box_top + Top Local ROI).
+# This file is intentionally self-contained so old experiment configs can be removed.
 
-# Semantic alias for the current main model.
+task: detection
+
+evaluator:
+  type: GrapePointEvaluator
+  iou_types: [bbox]
+  point_iou_threshold: 0.5
+  has_picking_threshold: 0.5
+
+num_classes: 1
+remap_mscoco_category: false
+
+train_dataloader:
+  type: DataLoader
+  dataset:
+    type: GrapePointCocoDetection
+    img_folder: ./dataset/train
+    ann_file: ./dataset/train/_annotations.grape_point.json
+    return_masks: false
+    transforms:
+      type: Compose
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 114}
+        - {type: Resize, size: [640, 640]}
+        - {type: ConvertPILImage, dtype: float32, scale: true}
+        - {type: ConvertBoxes, fmt: cxcywh, normalize: true}
+      policy:
+        name: stop_epoch
+        epoch: 72
+        ops: [RandomPhotometricDistort, RandomZoomOut]
+      mosaic_prob: 0.0
+    regenerate_point_offsets: true
+    point_offset_mode: top_center
+    point_top_anchor_ratio: 0.12
+  shuffle: true
+  num_workers: 0
+  drop_last: true
+  collate_fn:
+    type: BatchImageCollateFunction
+    base_size: 640
+    base_size_repeat: null
+    stop_epoch: 72
+    ema_restart_decay: 0.9999
+    mixup_prob: 0.0
+    mixup_epochs: [0, 0]
+  total_batch_size: 8
+
+val_dataloader:
+  type: DataLoader
+  dataset:
+    type: GrapePointCocoDetection
+    img_folder: ./dataset/valid
+    ann_file: ./dataset/valid/_annotations.grape_point.json
+    return_masks: false
+    transforms:
+      type: Compose
+      ops:
+        - {type: Resize, size: [640, 640]}
+        - {type: ConvertPILImage, dtype: float32, scale: true}
+    regenerate_point_offsets: true
+    point_offset_mode: top_center
+    point_top_anchor_ratio: 0.12
+  shuffle: false
+  num_workers: 0
+  drop_last: false
+  collate_fn:
+    type: BatchImageCollateFunction
+  total_batch_size: 8
+
+print_freq: 50
+output_dir: ./outputs/grape_point_v7_exp2_query_box_top_center_toproi
+checkpoint_freq: 4
+sync_bn: false
+find_unused_parameters: false
+
+use_amp: true
+scaler:
+  type: GradScaler
+  enabled: true
+
+use_ema: true
+ema:
+  type: ModelEMA
+  decay: 0.9999
+  warmups: 1000
+  start: 0
+
+epoches: 100
+clip_max_norm: 0.1
+
+optimizer:
+  type: AdamW
+  params:
+    - params: ^(?=.*backbone)(?!.*bn).*$
+      lr: 0.00005
+    - params: ^(?=.*(?:norm|bn)).*$
+      weight_decay: 0.0
+  lr: 0.0001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+lr_scheduler:
+  type: MultiStepLR
+  milestones: [500]
+  gamma: 0.1
+
+lr_warmup_scheduler:
+  type: LinearWarmup
+  warmup_duration: 500
+
+model: RTv4
+criterion: RTv4Criterion
+postprocessor: PostProcessor
+use_focal_loss: true
+eval_spatial_size: [640, 640]
+
+RTv4:
+  backbone: HGNetv2
+  encoder: HybridEncoder
+  decoder: DFINETransformer
+
+lrsheduler: flatcosine
+lr_gamma: 0.5
+warmup_iter: 2000
+flat_epoch: 40
+no_aug_epoch: 8
+
+HGNetv2:
+  pretrained: true
+  local_model_dir: ./pretrain/hgnetv2/
+  name: B0
+  return_idx: [1, 2, 3]
+  freeze_at: -1
+  freeze_norm: false
+  use_lab: true
+
+HybridEncoder:
+  in_channels: [256, 512, 1024]
+  feat_strides: [8, 16, 32]
+  hidden_dim: 256
+  use_encoder_idx: [2]
+  num_encoder_layers: 1
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.0
+  enc_act: gelu
+  expansion: 0.5
+  depth_mult: 0.34
+  act: silu
+
+DFINETransformer:
+  feat_channels: [256, 256, 256]
+  feat_strides: [8, 16, 32]
+  hidden_dim: 256
+  num_levels: 3
+  num_layers: 3
+  eval_idx: -1
+  num_queries: 300
+  num_denoising: 100
+  label_noise_ratio: 0.5
+  box_noise_scale: 1.0
+  reg_max: 32
+  reg_scale: 4
+  layer_scale: 1
+  num_points: [3, 6, 3]
+  cross_attn_method: default
+  query_select_method: default
+  activation: silu
+  mlp_act: silu
+  use_picking_point_head: true
+  has_picking_head_layers: 3
+  picking_offset_head_layers: 3
+  point_head_hidden_scale: 1.0
+  point_instance_binding_mode: query_box_top
+  point_offset_activation: identity
+  point_offset_min: -0.25
+  point_offset_max: 1.25
+  point_top_local_width_scale: 1.08
+  point_top_local_y_min_ratio: -0.1
+  point_top_local_y_max_ratio: 0.4
+
+PostProcessor:
+  num_top_queries: 300
+  use_picking_point: true
+  has_picking_threshold: 0.5
+  point_offset_mode: top_center
+  point_top_anchor_ratio: 0.12
+
+RTv4Criterion:
+  weight_dict:
+    loss_vfl: 1
+    loss_bbox: 5
+    loss_giou: 2
+    loss_fgl: 0.15
+    loss_ddf: 1.5
+    loss_mal: 1
+    loss_distill: 10.0
+    loss_has_picking: 1.2
+    loss_picking_offset: 4.0
+  losses: [mal, boxes, local, has_picking, picking_offset]
+  alpha: 0.75
+  gamma: 1.5
+  reg_max: 32
+  matcher:
+    type: HungarianMatcher
+    weight_dict:
+      cost_class: 2
+      cost_bbox: 5
+      cost_giou: 2
+    alpha: 0.25
+    gamma: 2.0
+  point_loss_type: wing
+  wing_loss_omega: 0.25
+  wing_loss_epsilon: 0.05
+  point_coord_weight_x: 1.0
+  point_coord_weight_y: 1.3
+
+point_checkpointing:
+  enabled: true
+  grape_class_name: grape
+  alpha: 0.35
+  beta: 0.20
+  point_error_norm_px: 40.0
+
+point_training_schedule:
+  phase2:
+    enabled: true
+    start_epoch: 72
+    weight_multipliers:
+      loss_bbox: 0.90
+      loss_giou: 0.90
+      loss_fgl: 0.90
+      loss_ddf: 0.90
+      loss_has_picking: 1.15
+      loss_picking_offset: 1.10

@@ -194,7 +194,7 @@ class DetSolver(BaseSolver):
                 "metrics": dict(metrics),
                 "path": path.name,
             }
-            dist_utils.save_on_master(self.state_dict(), path)
+            dist_utils.save_on_master(self.state_dict(last_epoch=epoch), path)
             changed = True
 
         if changed and dist_utils.is_main_process():
@@ -497,13 +497,13 @@ class DetSolver(BaseSolver):
         return
 
 
-    def state_dict(self):
+    def state_dict(self, last_epoch=None):
         """State dict, train/eval"""
         state = {}
         state['date'] = datetime.datetime.now().isoformat()
 
         # For resume
-        state['last_epoch'] = self.last_epoch
+        state['last_epoch'] = self.last_epoch if last_epoch is None else int(last_epoch)
 
         for k, v in self.__dict__.items():
             if k == 'teacher_model':

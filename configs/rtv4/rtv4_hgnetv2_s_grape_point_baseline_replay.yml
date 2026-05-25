@@ -1,5 +1,0 @@
-__include__: [
-  './rtv4_hgnetv2_s_grape_point_v2.yml'
-]
-
-# Semantic alias for the formal baseline used in writing.

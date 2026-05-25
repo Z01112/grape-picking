@@ -1,5 +1,0 @@
-__include__: [
-  './rtv4_hgnetv2_s_grape_point_v7_exp1.yml'
-]
-
-# Semantic alias for the top-center transition model.
