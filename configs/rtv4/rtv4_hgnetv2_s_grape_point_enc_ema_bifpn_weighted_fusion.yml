@@ -1,0 +1,11 @@
+__include__: [
+  ./rtv4_hgnetv2_s_grape_point_main.yml
+]
+
+output_dir: ./outputs/02_encoder_experiments/encoder_ema_bifpn_weighted_fusion_100e_backbone_pretrain_20260526
+
+HybridEncoder:
+  ema_mode: ema
+  ema_groups: 8
+  weighted_fusion_mode: bifpn
+  weighted_fusion_eps: 0.0001

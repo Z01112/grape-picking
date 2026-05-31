@@ -216,6 +216,57 @@ class RepNCSPELAN4(nn.Module):
         return self.cv4(torch.cat(y, 1))
 
 
+class EMAFeatureAttention(nn.Module):
+    def __init__(self, channels, groups=8):
+        super().__init__()
+        assert channels % groups == 0, "channels must be divisible by groups"
+        self.groups = groups
+        group_channels = channels // groups
+        self.conv1x1 = nn.Conv2d(group_channels, group_channels, 1, bias=True)
+        self.conv3x3 = nn.Conv2d(group_channels, group_channels, 3, padding=1, bias=True)
+        self.group_norm = nn.GroupNorm(group_channels, group_channels)
+        self.softmax = nn.Softmax(dim=-1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        grouped = x.reshape(b * self.groups, c // self.groups, h, w)
+
+        x_h = grouped.mean(dim=3, keepdim=True)
+        x_w = grouped.mean(dim=2, keepdim=True).permute(0, 1, 3, 2)
+        coord = self.conv1x1(torch.cat([x_h, x_w], dim=2))
+        attn_h, attn_w = torch.split(coord, [h, w], dim=2)
+        attn_w = attn_w.permute(0, 1, 3, 2)
+
+        gated = self.group_norm(grouped * attn_h.sigmoid() * attn_w.sigmoid())
+        local = self.conv3x3(grouped)
+
+        gate_weight = self.softmax(gated.mean(dim=(2, 3))).unsqueeze(1)
+        local_weight = self.softmax(local.mean(dim=(2, 3))).unsqueeze(1)
+        gated_flat = gated.flatten(2)
+        local_flat = local.flatten(2)
+        weights = (
+            torch.matmul(gate_weight, local_flat) +
+            torch.matmul(local_weight, gated_flat)
+        ).reshape(b * self.groups, 1, h, w)
+
+        enhanced = (grouped * weights.sigmoid()).reshape(b, c, h, w)
+        return x + self.gamma * enhanced
+
+
+class WeightedConcatFusion2d(nn.Module):
+    def __init__(self, num_inputs=2, eps=1e-4):
+        super().__init__()
+        self.weights = nn.Parameter(torch.ones(num_inputs, dtype=torch.float32))
+        self.eps = eps
+
+    def forward(self, feats):
+        assert len(feats) == self.weights.numel()
+        weights = F.relu(self.weights)
+        weights = weights / (weights.sum() + self.eps)
+        return torch.concat([weight * feat for weight, feat in zip(weights, feats)], dim=1)
+
+
 # transformer
 class TransformerEncoderLayer(nn.Module):
     def __init__(self,
@@ -304,6 +355,10 @@ class HybridEncoder(nn.Module):
                  eval_spatial_size=None,
                  version='dfine',
                  distill_teacher_dim=0,
+                 ema_mode=None,
+                 ema_groups=8,
+                 weighted_fusion_mode=None,
+                 weighted_fusion_eps=1e-4,
                  ):
         super().__init__()
         self.in_channels = in_channels
@@ -313,6 +368,11 @@ class HybridEncoder(nn.Module):
         self.num_encoder_layers = num_encoder_layers
         self.pe_temperature = pe_temperature
         self.eval_spatial_size = eval_spatial_size
+        self.ema_mode = ema_mode
+        self.ema_groups = ema_groups
+        self.weighted_fusion_mode = weighted_fusion_mode
+        self.weighted_fusion_eps = weighted_fusion_eps
+
         self.out_channels = [hidden_dim for _ in range(len(in_channels))]
         self.out_strides = feat_strides
         self.distill_teacher_dim = distill_teacher_dim
@@ -379,6 +439,31 @@ class HybridEncoder(nn.Module):
                 if version == 'dfine' else CSPLayer(hidden_dim * 2, hidden_dim, round(3 * depth_mult), act=act, expansion=expansion, bottletype=VGGBlock)
             )
 
+        if weighted_fusion_mode is None:
+            self.top_down_fusion = None
+            self.bottom_up_fusion = None
+        elif weighted_fusion_mode == 'bifpn':
+            self.top_down_fusion = nn.ModuleList([
+                WeightedConcatFusion2d(2, eps=weighted_fusion_eps)
+                for _ in range(len(in_channels) - 1)
+            ])
+            self.bottom_up_fusion = nn.ModuleList([
+                WeightedConcatFusion2d(2, eps=weighted_fusion_eps)
+                for _ in range(len(in_channels) - 1)
+            ])
+        else:
+            raise ValueError(f"Unsupported weighted_fusion_mode: {weighted_fusion_mode}")
+
+        if ema_mode is None:
+            self.ema_fusion = None
+        elif ema_mode == 'ema':
+            self.ema_fusion = nn.ModuleList([
+                EMAFeatureAttention(hidden_dim, groups=ema_groups)
+                for _ in range(len(in_channels))
+            ])
+        else:
+            raise ValueError(f"Unsupported ema_mode: {ema_mode}")
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -441,12 +526,17 @@ class HybridEncoder(nn.Module):
         # broadcasting and fusion
         inner_outs = [proj_feats[-1]]
         for idx in range(len(self.in_channels) - 1, 0, -1):
+            fusion_idx = len(self.in_channels) - 1 - idx
             feat_heigh = inner_outs[0]
             feat_low = proj_feats[idx - 1]
-            feat_heigh = self.lateral_convs[len(self.in_channels) - 1 - idx](feat_heigh)
+            feat_heigh = self.lateral_convs[fusion_idx](feat_heigh)
             inner_outs[0] = feat_heigh
             upsample_feat = F.interpolate(feat_heigh, scale_factor=2., mode='nearest')
-            inner_out = self.fpn_blocks[len(self.in_channels)-1-idx](torch.concat([upsample_feat, feat_low], dim=1))
+            if self.top_down_fusion is not None:
+                fused_feat = self.top_down_fusion[fusion_idx]([upsample_feat, feat_low])
+            else:
+                fused_feat = torch.concat([upsample_feat, feat_low], dim=1)
+            inner_out = self.fpn_blocks[fusion_idx](fused_feat)
             inner_outs.insert(0, inner_out)
 
         outs = [inner_outs[0]]
@@ -454,8 +544,15 @@ class HybridEncoder(nn.Module):
             feat_low = outs[-1]
             feat_height = inner_outs[idx + 1]
             downsample_feat = self.downsample_convs[idx](feat_low)
-            out = self.pan_blocks[idx](torch.concat([downsample_feat, feat_height], dim=1))
+            if self.bottom_up_fusion is not None:
+                fused_feat = self.bottom_up_fusion[idx]([downsample_feat, feat_height])
+            else:
+                fused_feat = torch.concat([downsample_feat, feat_height], dim=1)
+            out = self.pan_blocks[idx](fused_feat)
             outs.append(out)
+
+        if self.ema_fusion is not None:
+            outs = [attn(feat) for attn, feat in zip(self.ema_fusion, outs)]
 
         if self.training and distill_student_output is not None:
             return outs, distill_student_output

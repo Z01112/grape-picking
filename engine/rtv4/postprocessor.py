@@ -45,6 +45,20 @@ class PostProcessor(nn.Module):
         point_decode_clamp_y_min=None,
         point_decode_clamp_y_max=None,
         point_debug_roundtrip=False,
+        point_visibility_score_mode="has",
+        point_quality_score_alpha=1.0,
+        point_selector_score_alpha=1.0,
+        point_accept_score_alpha=1.0,
+        use_toproi_simcc_refiner=False,
+        toproi_simcc_x_min=-0.60,
+        toproi_simcc_x_max=0.60,
+        toproi_simcc_y_min=-0.35,
+        toproi_simcc_y_max=0.45,
+        use_toproi_heatmap_refiner=False,
+        toproi_heatmap_x_min=-0.60,
+        toproi_heatmap_x_max=0.60,
+        toproi_heatmap_y_min=-0.35,
+        toproi_heatmap_y_max=0.45,
     ) -> None:
         super().__init__()
         self.use_focal_loss = use_focal_loss
@@ -60,7 +74,73 @@ class PostProcessor(nn.Module):
         self.point_decode_clamp_y_min = None if point_decode_clamp_y_min is None else float(point_decode_clamp_y_min)
         self.point_decode_clamp_y_max = None if point_decode_clamp_y_max is None else float(point_decode_clamp_y_max)
         self.point_debug_roundtrip = bool(point_debug_roundtrip)
+        self.point_visibility_score_mode = str(point_visibility_score_mode).strip().lower()
+        self.point_quality_score_alpha = float(point_quality_score_alpha)
+        self.point_selector_score_alpha = float(point_selector_score_alpha)
+        self.point_accept_score_alpha = float(point_accept_score_alpha)
+        self.use_toproi_simcc_refiner = bool(use_toproi_simcc_refiner)
+        self.toproi_simcc_x_min = float(toproi_simcc_x_min)
+        self.toproi_simcc_x_max = float(toproi_simcc_x_max)
+        self.toproi_simcc_y_min = float(toproi_simcc_y_min)
+        self.toproi_simcc_y_max = float(toproi_simcc_y_max)
+        self.use_toproi_heatmap_refiner = bool(use_toproi_heatmap_refiner)
+        self.toproi_heatmap_x_min = float(toproi_heatmap_x_min)
+        self.toproi_heatmap_x_max = float(toproi_heatmap_x_max)
+        self.toproi_heatmap_y_min = float(toproi_heatmap_y_min)
+        self.toproi_heatmap_y_max = float(toproi_heatmap_y_max)
+        if self.toproi_simcc_x_max <= self.toproi_simcc_x_min:
+            self.toproi_simcc_x_max = self.toproi_simcc_x_min + 1.0
+        if self.toproi_simcc_y_max <= self.toproi_simcc_y_min:
+            self.toproi_simcc_y_max = self.toproi_simcc_y_min + 1.0
+        if self.toproi_heatmap_x_max <= self.toproi_heatmap_x_min:
+            self.toproi_heatmap_x_max = self.toproi_heatmap_x_min + 1.0
+        if self.toproi_heatmap_y_max <= self.toproi_heatmap_y_min:
+            self.toproi_heatmap_y_max = self.toproi_heatmap_y_min + 1.0
+        if self.point_visibility_score_mode not in {"has", "quality", "selector", "accept"}:
+            raise ValueError(
+                f"Unsupported point_visibility_score_mode={point_visibility_score_mode!r}; "
+                "expected 'has', 'quality', 'selector', or 'accept'."
+            )
         self.deploy_mode = False
+
+    @staticmethod
+    def _decode_simcc_offsets(
+        logits_x: torch.Tensor,
+        logits_y: torch.Tensor,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+    ) -> torch.Tensor:
+        dtype = logits_x.dtype
+        device = logits_x.device
+        x_bins = torch.linspace(float(x_min), float(x_max), logits_x.shape[-1], device=device, dtype=dtype)
+        y_bins = torch.linspace(float(y_min), float(y_max), logits_y.shape[-1], device=device, dtype=dtype)
+        prob_x = F.softmax(logits_x, dim=-1)
+        prob_y = F.softmax(logits_y, dim=-1)
+        off_x = (prob_x * x_bins).sum(dim=-1)
+        off_y = (prob_y * y_bins).sum(dim=-1)
+        return torch.stack((off_x, off_y), dim=-1)
+
+    @staticmethod
+    def _decode_heatmap_offsets(
+        logits: torch.Tensor,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+    ) -> torch.Tensor:
+        dtype = logits.dtype
+        device = logits.device
+        height, width = logits.shape[-2:]
+        x_bins = torch.linspace(float(x_min), float(x_max), width, device=device, dtype=dtype)
+        y_bins = torch.linspace(float(y_min), float(y_max), height, device=device, dtype=dtype)
+        prob = F.softmax(logits.flatten(-2), dim=-1).reshape_as(logits)
+        prob_x = prob.sum(dim=-2)
+        prob_y = prob.sum(dim=-1)
+        off_x = (prob_x * x_bins).sum(dim=-1)
+        off_y = (prob_y * y_bins).sum(dim=-1)
+        return torch.stack((off_x, off_y), dim=-1)
 
     def extra_repr(self) -> str:
         return (
@@ -84,6 +164,11 @@ class PostProcessor(nn.Module):
         picking_offsets = None
         point_quality_scores = None
         point_final_scores = None
+        point_selector_scores = None
+        point_selector_final_scores = None
+        point_accept_scores = None
+        point_accept_final_scores = None
+        weak_heatmap_scores = None
 
         if self.use_focal_loss:
             scores = F.sigmoid(logits)
@@ -117,6 +202,12 @@ class PostProcessor(nn.Module):
             pred_has_picking = outputs['pred_has_picking']
             pred_offsets = outputs['pred_picking_offsets']
             pred_point_quality = outputs.get('pred_point_quality')
+            pred_point_selector = outputs.get('pred_point_selector')
+            pred_point_accept = outputs.get('pred_point_accept')
+            pred_weak_heatmap = outputs.get('pred_weak_heatmap_score')
+            pred_simcc_x = outputs.get('pred_toproi_simcc_x')
+            pred_simcc_y = outputs.get('pred_toproi_simcc_y')
+            pred_toproi_heatmap = outputs.get('pred_toproi_heatmap')
 
             # Keep point outputs aligned with the same top-k grape queries used
             # for labels/scores/boxes.
@@ -134,6 +225,56 @@ class PostProcessor(nn.Module):
                         dim=1,
                         index=index.unsqueeze(-1).repeat(1, 1, pred_point_quality.shape[-1]),
                     )
+                if pred_point_selector is not None:
+                    pred_point_selector = pred_point_selector.gather(
+                        dim=1,
+                        index=index.unsqueeze(-1).repeat(1, 1, pred_point_selector.shape[-1]),
+                    )
+                if pred_point_accept is not None:
+                    pred_point_accept = pred_point_accept.gather(
+                        dim=1,
+                        index=index.unsqueeze(-1).repeat(1, 1, pred_point_accept.shape[-1]),
+                    )
+                if pred_weak_heatmap is not None:
+                    pred_weak_heatmap = pred_weak_heatmap.gather(
+                        dim=1,
+                        index=index.unsqueeze(-1).repeat(1, 1, pred_weak_heatmap.shape[-1]),
+                    )
+                if pred_simcc_x is not None:
+                    pred_simcc_x = pred_simcc_x.gather(
+                        dim=1,
+                        index=index.unsqueeze(-1).repeat(1, 1, pred_simcc_x.shape[-1]),
+                    )
+                if pred_simcc_y is not None:
+                    pred_simcc_y = pred_simcc_y.gather(
+                        dim=1,
+                        index=index.unsqueeze(-1).repeat(1, 1, pred_simcc_y.shape[-1]),
+                    )
+                if pred_toproi_heatmap is not None:
+                    pred_toproi_heatmap = pred_toproi_heatmap.gather(
+                        dim=1,
+                        index=index.unsqueeze(-1).unsqueeze(-1).repeat(
+                            1, 1, pred_toproi_heatmap.shape[-2], pred_toproi_heatmap.shape[-1]
+                        ),
+                    )
+
+            if self.use_toproi_simcc_refiner and pred_simcc_x is not None and pred_simcc_y is not None:
+                pred_offsets = self._decode_simcc_offsets(
+                    pred_simcc_x,
+                    pred_simcc_y,
+                    self.toproi_simcc_x_min,
+                    self.toproi_simcc_x_max,
+                    self.toproi_simcc_y_min,
+                    self.toproi_simcc_y_max,
+                ).to(dtype=pred_offsets.dtype)
+            if self.use_toproi_heatmap_refiner and pred_toproi_heatmap is not None:
+                pred_offsets = self._decode_heatmap_offsets(
+                    pred_toproi_heatmap,
+                    self.toproi_heatmap_x_min,
+                    self.toproi_heatmap_x_max,
+                    self.toproi_heatmap_y_min,
+                    self.toproi_heatmap_y_max,
+                ).to(dtype=pred_offsets.dtype)
 
             if any(v is not None for v in (self.point_decode_clamp_x_abs, self.point_decode_clamp_y_min, self.point_decode_clamp_y_max)):
                 pred_offsets = pred_offsets.clone()
@@ -171,12 +312,33 @@ class PostProcessor(nn.Module):
             # The 0.5 threshold in the main config gates valid picking points
             # for evaluation or downstream use, but the candidate coordinates
             # remain available for visualization/debugging.
-            has_picking_scores = F.sigmoid(pred_has_picking).squeeze(-1)
-            has_picking_flags = has_picking_scores >= self.has_picking_threshold
+            raw_has_picking_scores = F.sigmoid(pred_has_picking).squeeze(-1)
+            has_picking_scores = raw_has_picking_scores
             picking_offsets = pred_offsets
             if pred_point_quality is not None:
                 point_quality_scores = F.sigmoid(pred_point_quality).squeeze(-1)
-                point_final_scores = has_picking_scores * point_quality_scores
+                point_final_scores = raw_has_picking_scores * point_quality_scores.clamp(min=0.0, max=1.0).pow(
+                    self.point_quality_score_alpha
+                )
+                if self.point_visibility_score_mode == "quality":
+                    has_picking_scores = point_final_scores
+            if pred_point_selector is not None:
+                point_selector_scores = F.sigmoid(pred_point_selector).squeeze(-1)
+                point_selector_final_scores = raw_has_picking_scores * point_selector_scores.clamp(min=0.0, max=1.0).pow(
+                    self.point_selector_score_alpha
+                )
+                if self.point_visibility_score_mode == "selector":
+                    has_picking_scores = point_selector_final_scores
+            if pred_point_accept is not None:
+                point_accept_scores = F.sigmoid(pred_point_accept).squeeze(-1)
+                point_accept_final_scores = raw_has_picking_scores * point_accept_scores.clamp(min=0.0, max=1.0).pow(
+                    self.point_accept_score_alpha
+                )
+                if self.point_visibility_score_mode == "accept":
+                    has_picking_scores = point_accept_final_scores
+            if pred_weak_heatmap is not None:
+                weak_heatmap_scores = F.sigmoid(pred_weak_heatmap).squeeze(-1)
+            has_picking_flags = has_picking_scores >= self.has_picking_threshold
 
         # TODO for onnx export
         if self.deploy_mode:
@@ -201,6 +363,11 @@ class PostProcessor(nn.Module):
                 picking_offsets,
                 point_quality_scores if point_quality_scores is not None else [None] * len(labels),
                 point_final_scores if point_final_scores is not None else [None] * len(labels),
+                point_selector_scores if point_selector_scores is not None else [None] * len(labels),
+                point_selector_final_scores if point_selector_final_scores is not None else [None] * len(labels),
+                point_accept_scores if point_accept_scores is not None else [None] * len(labels),
+                point_accept_final_scores if point_accept_final_scores is not None else [None] * len(labels),
+                weak_heatmap_scores if weak_heatmap_scores is not None else [None] * len(labels),
             )
 
         for items in zipped:
@@ -208,7 +375,7 @@ class PostProcessor(nn.Module):
                 lab, box, sco = items
                 result = dict(labels=lab, boxes=box, scores=sco)
             else:
-                lab, box, sco, has_score, has_flag, point_xy, offset_xy, quality_score, final_score = items
+                lab, box, sco, has_score, has_flag, point_xy, offset_xy, quality_score, final_score, selector_score, selector_final_score, accept_score, accept_final_score, heatmap_score = items
                 result = dict(
                     labels=lab,
                     boxes=box,
@@ -222,6 +389,16 @@ class PostProcessor(nn.Module):
                     result["point_quality_scores"] = quality_score
                 if final_score is not None:
                     result["point_final_scores"] = final_score
+                if selector_score is not None:
+                    result["point_selector_scores"] = selector_score
+                if selector_final_score is not None:
+                    result["point_selector_final_scores"] = selector_final_score
+                if accept_score is not None:
+                    result["point_accept_scores"] = accept_score
+                if accept_final_score is not None:
+                    result["point_accept_final_scores"] = accept_final_score
+                if heatmap_score is not None:
+                    result["weak_heatmap_scores"] = heatmap_score
             results.append(result)
 
         return results

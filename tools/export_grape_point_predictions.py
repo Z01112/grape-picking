@@ -123,7 +123,12 @@ def main() -> int:
                     points = result.get("picking_points")
                     quality_scores = result.get("point_quality_scores")
                     final_scores = result.get("point_final_scores")
+                    accept_scores = result.get("point_accept_scores")
+                    accept_final_scores = result.get("point_accept_final_scores")
+                    weak_heatmap_scores = result.get("weak_heatmap_scores")
                     has_quality_scores = quality_scores is not None
+                    has_accept_scores = accept_scores is not None
+                    has_weak_heatmap_scores = weak_heatmap_scores is not None
                     if has_scores is None:
                         has_scores = torch.zeros((boxes.shape[0],), dtype=torch.float32)
                     else:
@@ -144,6 +149,18 @@ def main() -> int:
                         final_scores = has_scores * quality_scores
                     else:
                         final_scores = final_scores.detach().cpu().to(torch.float32)
+                    if accept_scores is None:
+                        accept_scores = torch.zeros((boxes.shape[0],), dtype=torch.float32)
+                    else:
+                        accept_scores = accept_scores.detach().cpu().to(torch.float32)
+                    if accept_final_scores is None:
+                        accept_final_scores = has_scores * accept_scores
+                    else:
+                        accept_final_scores = accept_final_scores.detach().cpu().to(torch.float32)
+                    if weak_heatmap_scores is None:
+                        weak_heatmap_scores = torch.zeros((boxes.shape[0],), dtype=torch.float32)
+                    else:
+                        weak_heatmap_scores = weak_heatmap_scores.detach().cpu().to(torch.float32)
 
                     for idx in range(boxes.shape[0]):
                         score = float(scores[idx].item())
@@ -161,6 +178,11 @@ def main() -> int:
                         if has_quality_scores:
                             item["point_quality_score"] = float(quality_scores[idx].item())
                             item["final_score"] = float(final_scores[idx].item())
+                        if has_accept_scores:
+                            item["point_accept_score"] = float(accept_scores[idx].item())
+                            item["point_accept_final_score"] = float(accept_final_scores[idx].item())
+                        if has_weak_heatmap_scores:
+                            item["weak_heatmap_score"] = float(weak_heatmap_scores[idx].item())
                         predictions.append(item)
     finally:
         dist_utils.cleanup()

@@ -456,6 +456,15 @@ class DFINETransformer(nn.Module):
                  use_point_quality_head=False,
                  point_quality_head_layers=2,
                  point_quality_detach_input=False,
+                 use_point_selector_head=False,
+                 point_selector_head_layers=2,
+                 point_selector_detach_input=True,
+                 use_point_accept_head=False,
+                 point_accept_head_layers=2,
+                 point_accept_detach_input=True,
+                 use_weak_point_heatmap_head=False,
+                 weak_heatmap_head_layers=2,
+                 weak_heatmap_detach_input=True,
                  point_head_hidden_scale=1.0,
                  point_local_feature_fusion=False,
                  point_instance_binding_mode='legacy',
@@ -482,6 +491,15 @@ class DFINETransformer(nn.Module):
                  point_offset_top_local_width_scale=1.08,
                  point_offset_top_local_y_min_ratio=-0.20,
                  point_offset_top_local_y_max_ratio=0.55,
+                 use_toproi_simcc_refiner=False,
+                 toproi_simcc_head_layers=2,
+                 toproi_simcc_detach_input=True,
+                 toproi_simcc_bins_x=64,
+                 toproi_simcc_bins_y=64,
+                 use_toproi_heatmap_refiner=False,
+                 toproi_heatmap_size=12,
+                 toproi_heatmap_detach_input=True,
+                 toproi_heatmap_hidden_scale=0.50,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -508,6 +526,15 @@ class DFINETransformer(nn.Module):
         self.use_point_quality_head = bool(use_point_quality_head)
         self.point_quality_head_layers = max(int(point_quality_head_layers), 1)
         self.point_quality_detach_input = bool(point_quality_detach_input)
+        self.use_point_selector_head = bool(use_point_selector_head)
+        self.point_selector_head_layers = max(int(point_selector_head_layers), 1)
+        self.point_selector_detach_input = bool(point_selector_detach_input)
+        self.use_point_accept_head = bool(use_point_accept_head)
+        self.point_accept_head_layers = max(int(point_accept_head_layers), 1)
+        self.point_accept_detach_input = bool(point_accept_detach_input)
+        self.use_weak_point_heatmap_head = bool(use_weak_point_heatmap_head)
+        self.weak_heatmap_head_layers = max(int(weak_heatmap_head_layers), 1)
+        self.weak_heatmap_detach_input = bool(weak_heatmap_detach_input)
         self.point_head_hidden_scale = float(point_head_hidden_scale)
         self.point_local_feature_fusion = bool(point_local_feature_fusion)
         self.point_instance_binding_mode = str(point_instance_binding_mode).strip().lower()
@@ -552,6 +579,15 @@ class DFINETransformer(nn.Module):
         self.point_offset_top_local_width_scale = float(point_offset_top_local_width_scale)
         self.point_offset_top_local_y_min_ratio = float(point_offset_top_local_y_min_ratio)
         self.point_offset_top_local_y_max_ratio = float(point_offset_top_local_y_max_ratio)
+        self.use_toproi_simcc_refiner = bool(use_toproi_simcc_refiner)
+        self.toproi_simcc_head_layers = max(int(toproi_simcc_head_layers), 1)
+        self.toproi_simcc_detach_input = bool(toproi_simcc_detach_input)
+        self.toproi_simcc_bins_x = max(int(toproi_simcc_bins_x), 2)
+        self.toproi_simcc_bins_y = max(int(toproi_simcc_bins_y), 2)
+        self.use_toproi_heatmap_refiner = bool(use_toproi_heatmap_refiner)
+        self.toproi_heatmap_size = max(int(toproi_heatmap_size), 2)
+        self.toproi_heatmap_detach_input = bool(toproi_heatmap_detach_input)
+        self.toproi_heatmap_hidden_scale = max(float(toproi_heatmap_hidden_scale), 0.125)
         # GPPoint-DETR keeps the detector queries intact and changes only how
         # the per-query point feature is enriched before has/offset prediction.
         self.point_legacy_local_feature = self.point_instance_binding_mode == 'legacy' and self.point_local_feature_fusion
@@ -614,9 +650,21 @@ class DFINETransformer(nn.Module):
         self.dec_picking_head = None
         self.dec_picking_offset_head = None
         self.dec_point_quality_head = None
+        self.dec_point_selector_head = None
+        self.dec_point_accept_head = None
+        self.dec_weak_heatmap_head = None
+        self.dec_toproi_simcc_x_head = None
+        self.dec_toproi_simcc_y_head = None
+        self.dec_toproi_heatmap_head = None
         self.pre_picking_head = None
         self.pre_picking_offset_head = None
         self.pre_point_quality_head = None
+        self.pre_point_selector_head = None
+        self.pre_point_accept_head = None
+        self.pre_weak_heatmap_head = None
+        self.pre_toproi_simcc_x_head = None
+        self.pre_toproi_simcc_y_head = None
+        self.pre_toproi_heatmap_head = None
         self.dec_point_local_proj = None
         self.pre_point_local_proj = None
         self.dec_point_full_local_proj = None
@@ -689,6 +737,120 @@ class DFINETransformer(nn.Module):
                     self.point_quality_head_layers,
                     mlp_act,
                 )
+            if self.use_point_selector_head:
+                self.dec_point_selector_head = nn.ModuleList(
+                    [
+                        self._make_point_head(hidden_dim, point_hidden_dim, 1, self.point_selector_head_layers, mlp_act)
+                        for _ in range(self.eval_idx + 1)
+                    ]
+                  + [
+                        self._make_point_head(scaled_dim, point_hidden_dim_scaled, 1, self.point_selector_head_layers, mlp_act)
+                        for _ in range(num_layers - self.eval_idx - 1)
+                    ]
+                )
+                self.pre_point_selector_head = self._make_point_head(
+                    hidden_dim,
+                    point_hidden_dim,
+                    1,
+                    self.point_selector_head_layers,
+                    mlp_act,
+                )
+            if self.use_point_accept_head:
+                accept_geom_dim = 8  # box cxcywh + class score + has logit + predicted offset xy
+                self.dec_point_accept_head = nn.ModuleList(
+                    [
+                        self._make_point_head(
+                            hidden_dim * 2 + accept_geom_dim,
+                            point_hidden_dim,
+                            1,
+                            self.point_accept_head_layers,
+                            mlp_act,
+                        )
+                        for _ in range(self.eval_idx + 1)
+                    ]
+                  + [
+                        self._make_point_head(
+                            scaled_dim * 2 + accept_geom_dim,
+                            point_hidden_dim_scaled,
+                            1,
+                            self.point_accept_head_layers,
+                            mlp_act,
+                        )
+                        for _ in range(num_layers - self.eval_idx - 1)
+                    ]
+                )
+                self.pre_point_accept_head = self._make_point_head(
+                    hidden_dim * 2 + accept_geom_dim,
+                    point_hidden_dim,
+                    1,
+                    self.point_accept_head_layers,
+                    mlp_act,
+                )
+            if self.use_weak_point_heatmap_head:
+                self.dec_weak_heatmap_head = nn.ModuleList(
+                    [
+                        self._make_point_head(hidden_dim, point_hidden_dim, 1, self.weak_heatmap_head_layers, mlp_act)
+                        for _ in range(self.eval_idx + 1)
+                    ]
+                  + [
+                        self._make_point_head(scaled_dim, point_hidden_dim_scaled, 1, self.weak_heatmap_head_layers, mlp_act)
+                        for _ in range(num_layers - self.eval_idx - 1)
+                    ]
+                )
+                self.pre_weak_heatmap_head = self._make_point_head(
+                    hidden_dim,
+                    point_hidden_dim,
+                    1,
+                    self.weak_heatmap_head_layers,
+                    mlp_act,
+                )
+            if self.use_toproi_simcc_refiner:
+                # SimCC predicts independent x/y coordinate distributions for
+                # the top-ROI picking point.  By default it is detached from the
+                # shared query/ROI feature so the refiner can improve point
+                # expression without pulling detection or has_picking features.
+                self.dec_toproi_simcc_x_head = nn.ModuleList(
+                    [
+                        self._make_point_head(hidden_dim, point_hidden_dim, self.toproi_simcc_bins_x, self.toproi_simcc_head_layers, mlp_act)
+                        for _ in range(self.eval_idx + 1)
+                    ]
+                  + [
+                        self._make_point_head(scaled_dim, point_hidden_dim_scaled, self.toproi_simcc_bins_x, self.toproi_simcc_head_layers, mlp_act)
+                        for _ in range(num_layers - self.eval_idx - 1)
+                    ]
+                )
+                self.dec_toproi_simcc_y_head = nn.ModuleList(
+                    [
+                        self._make_point_head(hidden_dim, point_hidden_dim, self.toproi_simcc_bins_y, self.toproi_simcc_head_layers, mlp_act)
+                        for _ in range(self.eval_idx + 1)
+                    ]
+                  + [
+                        self._make_point_head(scaled_dim, point_hidden_dim_scaled, self.toproi_simcc_bins_y, self.toproi_simcc_head_layers, mlp_act)
+                        for _ in range(num_layers - self.eval_idx - 1)
+                    ]
+                )
+                self.pre_toproi_simcc_x_head = self._make_point_head(
+                    hidden_dim,
+                    point_hidden_dim,
+                    self.toproi_simcc_bins_x,
+                    self.toproi_simcc_head_layers,
+                    mlp_act,
+                )
+                self.pre_toproi_simcc_y_head = self._make_point_head(
+                    hidden_dim,
+                    point_hidden_dim,
+                    self.toproi_simcc_bins_y,
+                    self.toproi_simcc_head_layers,
+                    mlp_act,
+                )
+            if self.use_toproi_heatmap_refiner:
+                # Unlike query-vector SimCC, this head preserves the TopROI
+                # spatial feature map and predicts a 2D probability surface.
+                heatmap_hidden_dim = max(int(round(hidden_dim * self.toproi_heatmap_hidden_scale)), 1)
+                self.dec_toproi_heatmap_head = nn.ModuleList(
+                    [self._make_heatmap_head(hidden_dim, heatmap_hidden_dim, mlp_act) for _ in range(num_layers)]
+                )
+                self.pre_toproi_heatmap_head = self._make_heatmap_head(hidden_dim, heatmap_hidden_dim, mlp_act)
             if self.point_legacy_local_feature:
                 self.pre_point_local_proj = nn.Linear(hidden_dim, hidden_dim)
                 self.dec_point_local_proj = nn.ModuleList(
@@ -799,12 +961,44 @@ class DFINETransformer(nn.Module):
             self.dec_point_quality_head = nn.ModuleList(
                 [nn.Identity()] * (self.eval_idx) + [self.dec_point_quality_head[self.eval_idx]]
             )
+        if self.dec_point_selector_head is not None:
+            self.dec_point_selector_head = nn.ModuleList(
+                [nn.Identity()] * (self.eval_idx) + [self.dec_point_selector_head[self.eval_idx]]
+            )
+        if self.dec_point_accept_head is not None:
+            self.dec_point_accept_head = nn.ModuleList(
+                [nn.Identity()] * (self.eval_idx) + [self.dec_point_accept_head[self.eval_idx]]
+            )
+        if self.dec_weak_heatmap_head is not None:
+            self.dec_weak_heatmap_head = nn.ModuleList(
+                [nn.Identity()] * (self.eval_idx) + [self.dec_weak_heatmap_head[self.eval_idx]]
+            )
+        if self.dec_toproi_simcc_x_head is not None:
+            self.dec_toproi_simcc_x_head = nn.ModuleList(
+                [nn.Identity()] * (self.eval_idx) + [self.dec_toproi_simcc_x_head[self.eval_idx]]
+            )
+        if self.dec_toproi_simcc_y_head is not None:
+            self.dec_toproi_simcc_y_head = nn.ModuleList(
+                [nn.Identity()] * (self.eval_idx) + [self.dec_toproi_simcc_y_head[self.eval_idx]]
+            )
+        if self.dec_toproi_heatmap_head is not None:
+            self.dec_toproi_heatmap_head = nn.ModuleList(
+                [nn.Identity()] * (self.eval_idx) + [self.dec_toproi_heatmap_head[self.eval_idx]]
+            )
 
     @staticmethod
     def _make_point_head(input_dim, hidden_dim, output_dim, num_layers, act):
         if int(num_layers) <= 1:
             return nn.Linear(input_dim, output_dim)
         return MLP(input_dim, hidden_dim, output_dim, int(num_layers), act=act)
+
+    @staticmethod
+    def _make_heatmap_head(input_dim, hidden_dim, act):
+        return nn.Sequential(
+            nn.Conv2d(input_dim, hidden_dim, kernel_size=3, padding=1),
+            get_activation(act),
+            nn.Conv2d(hidden_dim, 1, kernel_size=1),
+        )
 
     def _activate_point_offsets(self, offsets: torch.Tensor) -> torch.Tensor:
         if self.point_offset_activation == 'identity':
@@ -954,6 +1148,71 @@ class DFINETransformer(nn.Module):
         pooled = pooled.mean(dim=(-1, -2))
         return pooled.reshape(bs, query_count, feat.shape[1])
 
+    def _pool_point_local_maps(
+        self,
+        proj_feats: List[torch.Tensor],
+        boxes_cxcywh: torch.Tensor,
+        roi_type: str = 'top',
+        output_size: int = None,
+        top_roi_params: tuple = None,
+    ) -> torch.Tensor:
+        level_idx = min(self.point_local_feature_level, len(proj_feats) - 1)
+        feat = proj_feats[level_idx]
+        bs, _, feat_h, feat_w = feat.shape
+        _, query_count, _ = boxes_cxcywh.shape
+        size = self.toproi_heatmap_size if output_size is None else max(int(output_size), 2)
+        if query_count == 0:
+            return feat.new_zeros((bs, 0, feat.shape[1], size, size))
+
+        roi_type = str(roi_type).strip().lower()
+        if roi_type == 'legacy':
+            rois_xyxy = self._build_top_local_rois(boxes_cxcywh, feat_h, feat_w)
+        elif roi_type == 'full':
+            rois_xyxy = self._build_full_local_rois(boxes_cxcywh, feat_h, feat_w)
+        elif roi_type == 'top':
+            if top_roi_params is None:
+                rois_xyxy = self._build_point_top_rois(boxes_cxcywh, feat_h, feat_w)
+            else:
+                rois_xyxy = self._build_point_top_rois(boxes_cxcywh, feat_h, feat_w, *top_roi_params)
+        else:
+            raise ValueError(f"Unsupported roi_type: {roi_type}")
+
+        batch_ids = torch.arange(bs, device=feat.device, dtype=rois_xyxy.dtype).view(bs, 1, 1).expand(bs, query_count, 1)
+        rois = torch.cat((batch_ids, rois_xyxy), dim=-1).reshape(-1, 5)
+        pooled = torchvision.ops.roi_align(
+            feat,
+            rois,
+            output_size=(size, size),
+            spatial_scale=1.0,
+            aligned=True,
+        )
+        return pooled.reshape(bs, query_count, feat.shape[1], size, size)
+
+    def _predict_toproi_heatmap(
+        self,
+        proj_feats: List[torch.Tensor],
+        boxes_cxcywh: torch.Tensor,
+        heatmap_head,
+        roi_boxes_cxcywh: torch.Tensor = None,
+        top_roi_params: tuple = None,
+    ) -> torch.Tensor:
+        if heatmap_head is None:
+            return None
+        local_boxes_cxcywh = boxes_cxcywh if roi_boxes_cxcywh is None else roi_boxes_cxcywh
+        maps = self._pool_point_local_maps(
+            proj_feats,
+            local_boxes_cxcywh,
+            roi_type='top',
+            output_size=self.toproi_heatmap_size,
+            top_roi_params=top_roi_params,
+        )
+        bs, query_count, channels, height, width = maps.shape
+        if query_count == 0:
+            return maps.new_zeros((bs, 0, height, width))
+        heatmap_input = maps.detach() if self.toproi_heatmap_detach_input else maps
+        logits = heatmap_head(heatmap_input.reshape(bs * query_count, channels, height, width))
+        return logits.reshape(bs, query_count, height, width)
+
     def _fuse_point_feature(
         self,
         hidden: torch.Tensor,
@@ -1009,10 +1268,17 @@ class DFINETransformer(nn.Module):
         self,
         hidden: torch.Tensor,
         boxes_cxcywh: torch.Tensor,
+        det_logits: torch.Tensor,
         proj_feats: List[torch.Tensor],
         cls_head,
         offset_head,
         quality_head,
+        selector_head,
+        accept_head,
+        weak_heatmap_head,
+        simcc_x_head,
+        simcc_y_head,
+        toproi_heatmap_head,
         legacy_local_proj_head,
         full_local_proj_head,
         top_local_proj_head,
@@ -1022,7 +1288,7 @@ class DFINETransformer(nn.Module):
         fusion_head,
         roi_boxes_cxcywh: torch.Tensor = None,
     ):
-        """Predict per-query has_picking logits, point offsets, and optional quality."""
+        """Predict per-query has_picking logits, point offsets, and optional point reliability."""
         cls_feature = self._fuse_point_feature(
             hidden,
             boxes_cxcywh,
@@ -1061,6 +1327,8 @@ class DFINETransformer(nn.Module):
             )
         else:
             offset_feature = cls_feature
+        has_logits = cls_head(cls_feature)
+        picking_offsets = self._activate_point_offsets(offset_head(offset_feature))
         if quality_head is not None:
             # v7_exp2_point_quality_sg uses the same quality target as the
             # original point_quality ablation, but stops quality-loss gradients
@@ -1069,7 +1337,73 @@ class DFINETransformer(nn.Module):
             quality_logits = quality_head(quality_feature)
         else:
             quality_logits = None
-        return cls_head(cls_feature), self._activate_point_offsets(offset_head(offset_feature)), quality_logits
+        if selector_head is not None:
+            # The selector is trained as a detached candidate-ranking head.  It
+            # must not reshape detector queries or point coordinates during the
+            # short probe, otherwise it collapses back into another point loss.
+            selector_feature = offset_feature.detach() if self.point_selector_detach_input else offset_feature
+            selector_logits = selector_head(selector_feature)
+        else:
+            selector_logits = None
+        if accept_head is not None:
+            # Set-aware accept scoring sees each candidate together with a
+            # detached global candidate-set context and detached geometry.  The
+            # listwise accept loss therefore trains only this ranking head.
+            accept_base = offset_feature.detach() if self.point_accept_detach_input else offset_feature
+            accept_context = accept_base.mean(dim=1, keepdim=True).expand_as(accept_base)
+            if det_logits is None:
+                det_score = boxes_cxcywh.new_zeros((*boxes_cxcywh.shape[:2], 1))
+            else:
+                det_score = det_logits.detach().sigmoid().amax(dim=-1, keepdim=True).to(dtype=accept_base.dtype)
+            accept_geom = torch.cat(
+                (
+                    boxes_cxcywh.detach(),
+                    det_score,
+                    has_logits.detach(),
+                    picking_offsets.detach(),
+                ),
+                dim=-1,
+            ).to(dtype=accept_base.dtype)
+            accept_logits = accept_head(torch.cat((accept_base, accept_context, accept_geom), dim=-1))
+        else:
+            accept_logits = None
+        if weak_heatmap_head is not None:
+            # Query-level weak Gaussian score is supervised from existing bbox +
+            # visible 2D point labels.  Detach by default so it calibrates point
+            # reliability without changing detector/offset features.
+            heatmap_feature = offset_feature.detach() if self.weak_heatmap_detach_input else offset_feature
+            weak_heatmap_logits = weak_heatmap_head(heatmap_feature)
+        else:
+            weak_heatmap_logits = None
+        if simcc_x_head is not None and simcc_y_head is not None:
+            simcc_feature = offset_feature.detach() if self.toproi_simcc_detach_input else offset_feature
+            simcc_x_logits = simcc_x_head(simcc_feature)
+            simcc_y_logits = simcc_y_head(simcc_feature)
+        else:
+            simcc_x_logits = None
+            simcc_y_logits = None
+        heatmap_logits = self._predict_toproi_heatmap(
+            proj_feats,
+            boxes_cxcywh,
+            toproi_heatmap_head,
+            roi_boxes_cxcywh,
+            (
+                self.point_offset_top_local_width_scale,
+                self.point_offset_top_local_y_min_ratio,
+                self.point_offset_top_local_y_max_ratio,
+            ) if self.point_decoupled_roi else None,
+        )
+        return (
+            has_logits,
+            picking_offsets,
+            quality_logits,
+            selector_logits,
+            accept_logits,
+            weak_heatmap_logits,
+            simcc_x_logits,
+            simcc_y_logits,
+            heatmap_logits,
+        )
 
     def _get_dn_teacher_roi_boxes(self, denoising_bbox_unact: torch.Tensor, dn_meta: dict) -> torch.Tensor:
         if (
@@ -1099,6 +1433,16 @@ class DFINETransformer(nn.Module):
             self._init_reg_head_zero(self.pre_picking_offset_head)
         if self.pre_point_quality_head is not None:
             self._init_reg_head_zero(self.pre_point_quality_head)
+        if self.pre_point_selector_head is not None:
+            self._init_reg_head_zero(self.pre_point_selector_head)
+        if self.pre_point_accept_head is not None:
+            self._init_reg_head_zero(self.pre_point_accept_head)
+        if self.pre_weak_heatmap_head is not None:
+            self._init_reg_head_zero(self.pre_weak_heatmap_head)
+        if self.pre_toproi_simcc_x_head is not None:
+            self._init_reg_head_zero(self.pre_toproi_simcc_x_head)
+        if self.pre_toproi_simcc_y_head is not None:
+            self._init_reg_head_zero(self.pre_toproi_simcc_y_head)
         if self.pre_point_fusion_head is not None:
             self._init_reg_head_zero(self.pre_point_fusion_head)
 
@@ -1116,10 +1460,24 @@ class DFINETransformer(nn.Module):
         if self.dec_point_quality_head is not None:
             for head in self.dec_point_quality_head:
                 self._init_reg_head_zero(head)
+        if self.dec_point_selector_head is not None:
+            for head in self.dec_point_selector_head:
+                self._init_reg_head_zero(head)
+        if self.dec_point_accept_head is not None:
+            for head in self.dec_point_accept_head:
+                self._init_reg_head_zero(head)
+        if self.dec_weak_heatmap_head is not None:
+            for head in self.dec_weak_heatmap_head:
+                self._init_reg_head_zero(head)
+        if self.dec_toproi_simcc_x_head is not None:
+            for head in self.dec_toproi_simcc_x_head:
+                self._init_reg_head_zero(head)
+        if self.dec_toproi_simcc_y_head is not None:
+            for head in self.dec_toproi_simcc_y_head:
+                self._init_reg_head_zero(head)
         if self.dec_point_fusion_head is not None:
             for head in self.dec_point_fusion_head:
                 self._init_reg_head_zero(head)
-
         init.xavier_uniform_(self.enc_output[0].weight)
         if self.learn_query_content:
             init.xavier_uniform_(self.tgt_embed.weight)
@@ -1348,13 +1706,20 @@ class DFINETransformer(nn.Module):
             dn_out_hidden = None
 
         if self.use_picking_point_head:
-            pre_picking_logits, pre_picking_offsets, pre_point_quality_logits = self._predict_point_branch(
+            pre_picking_logits, pre_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits = self._predict_point_branch(
                 pre_hidden,
                 pre_bboxes,
+                pre_logits,
                 proj_feats,
                 self.pre_picking_head,
                 self.pre_picking_offset_head,
                 self.pre_point_quality_head,
+                self.pre_point_selector_head,
+                self.pre_point_accept_head,
+                self.pre_weak_heatmap_head,
+                self.pre_toproi_simcc_x_head,
+                self.pre_toproi_simcc_y_head,
+                None,
                 self.pre_point_local_proj,
                 self.pre_point_full_local_proj,
                 self.pre_point_top_local_proj,
@@ -1367,14 +1732,31 @@ class DFINETransformer(nn.Module):
             out_picking_logits_list = []
             out_picking_offsets_list = []
             out_point_quality_logits_list = []
+            out_point_selector_logits_list = []
+            out_point_accept_logits_list = []
+            out_weak_heatmap_logits_list = []
+            out_toproi_simcc_x_logits_list = []
+            out_toproi_simcc_y_logits_list = []
+            out_toproi_heatmap_logits_list = []
+            final_decoder_layer_idx = out_hidden.shape[0] - 1
             for layer_idx in range(out_hidden.shape[0]):
-                logits_i, offsets_i, quality_i = self._predict_point_branch(
+                heatmap_head_i = None
+                if self.dec_toproi_heatmap_head is not None and layer_idx == final_decoder_layer_idx:
+                    heatmap_head_i = self.dec_toproi_heatmap_head[layer_idx]
+                logits_i, offsets_i, quality_i, selector_i, accept_i, weak_heatmap_i, simcc_x_i, simcc_y_i, heatmap_i = self._predict_point_branch(
                     out_hidden[layer_idx],
                     out_bboxes[layer_idx],
+                    out_logits[layer_idx],
                     proj_feats,
                     self.dec_picking_head[layer_idx],
                     self.dec_picking_offset_head[layer_idx],
                     self.dec_point_quality_head[layer_idx] if self.dec_point_quality_head is not None else None,
+                    self.dec_point_selector_head[layer_idx] if self.dec_point_selector_head is not None else None,
+                    self.dec_point_accept_head[layer_idx] if self.dec_point_accept_head is not None else None,
+                    self.dec_weak_heatmap_head[layer_idx] if self.dec_weak_heatmap_head is not None else None,
+                    self.dec_toproi_simcc_x_head[layer_idx] if self.dec_toproi_simcc_x_head is not None else None,
+                    self.dec_toproi_simcc_y_head[layer_idx] if self.dec_toproi_simcc_y_head is not None else None,
+                    heatmap_head_i,
                     self.dec_point_local_proj[layer_idx] if self.dec_point_local_proj is not None else None,
                     self.dec_point_full_local_proj[layer_idx] if self.dec_point_full_local_proj is not None else None,
                     self.dec_point_top_local_proj[layer_idx] if self.dec_point_top_local_proj is not None else None,
@@ -1387,22 +1769,53 @@ class DFINETransformer(nn.Module):
                 out_picking_offsets_list.append(offsets_i)
                 if quality_i is not None:
                     out_point_quality_logits_list.append(quality_i)
+                if selector_i is not None:
+                    out_point_selector_logits_list.append(selector_i)
+                if accept_i is not None:
+                    out_point_accept_logits_list.append(accept_i)
+                if weak_heatmap_i is not None:
+                    out_weak_heatmap_logits_list.append(weak_heatmap_i)
+                if simcc_x_i is not None:
+                    out_toproi_simcc_x_logits_list.append(simcc_x_i)
+                if simcc_y_i is not None:
+                    out_toproi_simcc_y_logits_list.append(simcc_y_i)
+                if heatmap_i is not None:
+                    out_toproi_heatmap_logits_list.append(heatmap_i)
             out_picking_logits = torch.stack(out_picking_logits_list) if out_picking_logits_list else None
             out_picking_offsets = torch.stack(out_picking_offsets_list) if out_picking_offsets_list else None
             out_point_quality_logits = torch.stack(out_point_quality_logits_list) if out_point_quality_logits_list else None
+            out_point_selector_logits = torch.stack(out_point_selector_logits_list) if out_point_selector_logits_list else None
+            out_point_accept_logits = torch.stack(out_point_accept_logits_list) if out_point_accept_logits_list else None
+            out_weak_heatmap_logits = torch.stack(out_weak_heatmap_logits_list) if out_weak_heatmap_logits_list else None
+            out_toproi_simcc_x_logits = torch.stack(out_toproi_simcc_x_logits_list) if out_toproi_simcc_x_logits_list else None
+            out_toproi_simcc_y_logits = torch.stack(out_toproi_simcc_y_logits_list) if out_toproi_simcc_y_logits_list else None
+            out_toproi_heatmap_logits = torch.stack(out_toproi_heatmap_logits_list) if out_toproi_heatmap_logits_list else None
 
             if dn_out_hidden is not None:
                 dn_out_picking_logits_list = []
                 dn_out_picking_offsets_list = []
                 dn_out_point_quality_logits_list = []
+                dn_out_point_selector_logits_list = []
+                dn_out_point_accept_logits_list = []
+                dn_out_weak_heatmap_logits_list = []
+                dn_out_toproi_simcc_x_logits_list = []
+                dn_out_toproi_simcc_y_logits_list = []
+                dn_out_toproi_heatmap_logits_list = []
                 for layer_idx in range(dn_out_hidden.shape[0]):
-                    logits_i, offsets_i, quality_i = self._predict_point_branch(
+                    logits_i, offsets_i, quality_i, selector_i, accept_i, weak_heatmap_i, simcc_x_i, simcc_y_i, heatmap_i = self._predict_point_branch(
                         dn_out_hidden[layer_idx],
                         dn_out_bboxes[layer_idx],
+                        dn_out_logits[layer_idx],
                         proj_feats,
                         self.dec_picking_head[layer_idx],
                         self.dec_picking_offset_head[layer_idx],
                         self.dec_point_quality_head[layer_idx] if self.dec_point_quality_head is not None else None,
+                        self.dec_point_selector_head[layer_idx] if self.dec_point_selector_head is not None else None,
+                        self.dec_point_accept_head[layer_idx] if self.dec_point_accept_head is not None else None,
+                        self.dec_weak_heatmap_head[layer_idx] if self.dec_weak_heatmap_head is not None else None,
+                        self.dec_toproi_simcc_x_head[layer_idx] if self.dec_toproi_simcc_x_head is not None else None,
+                        self.dec_toproi_simcc_y_head[layer_idx] if self.dec_toproi_simcc_y_head is not None else None,
+                        None,
                         self.dec_point_local_proj[layer_idx] if self.dec_point_local_proj is not None else None,
                         self.dec_point_full_local_proj[layer_idx] if self.dec_point_full_local_proj is not None else None,
                         self.dec_point_top_local_proj[layer_idx] if self.dec_point_top_local_proj is not None else None,
@@ -1416,20 +1829,45 @@ class DFINETransformer(nn.Module):
                     dn_out_picking_offsets_list.append(offsets_i)
                     if quality_i is not None:
                         dn_out_point_quality_logits_list.append(quality_i)
+                    if selector_i is not None:
+                        dn_out_point_selector_logits_list.append(selector_i)
+                    if accept_i is not None:
+                        dn_out_point_accept_logits_list.append(accept_i)
+                    if weak_heatmap_i is not None:
+                        dn_out_weak_heatmap_logits_list.append(weak_heatmap_i)
+                    if simcc_x_i is not None:
+                        dn_out_toproi_simcc_x_logits_list.append(simcc_x_i)
+                    if simcc_y_i is not None:
+                        dn_out_toproi_simcc_y_logits_list.append(simcc_y_i)
+                    if heatmap_i is not None:
+                        dn_out_toproi_heatmap_logits_list.append(heatmap_i)
                 dn_out_picking_logits = torch.stack(dn_out_picking_logits_list) if dn_out_picking_logits_list else None
                 dn_out_picking_offsets = torch.stack(dn_out_picking_offsets_list) if dn_out_picking_offsets_list else None
                 dn_out_point_quality_logits = torch.stack(dn_out_point_quality_logits_list) if dn_out_point_quality_logits_list else None
+                dn_out_point_selector_logits = torch.stack(dn_out_point_selector_logits_list) if dn_out_point_selector_logits_list else None
+                dn_out_point_accept_logits = torch.stack(dn_out_point_accept_logits_list) if dn_out_point_accept_logits_list else None
+                dn_out_weak_heatmap_logits = torch.stack(dn_out_weak_heatmap_logits_list) if dn_out_weak_heatmap_logits_list else None
+                dn_out_toproi_simcc_x_logits = torch.stack(dn_out_toproi_simcc_x_logits_list) if dn_out_toproi_simcc_x_logits_list else None
+                dn_out_toproi_simcc_y_logits = torch.stack(dn_out_toproi_simcc_y_logits_list) if dn_out_toproi_simcc_y_logits_list else None
+                dn_out_toproi_heatmap_logits = torch.stack(dn_out_toproi_heatmap_logits_list) if dn_out_toproi_heatmap_logits_list else None
             else:
-                dn_out_picking_logits, dn_out_picking_offsets, dn_out_point_quality_logits = None, None, None
+                dn_out_picking_logits, dn_out_picking_offsets, dn_out_point_quality_logits, dn_out_point_selector_logits, dn_out_point_accept_logits, dn_out_weak_heatmap_logits, dn_out_toproi_simcc_x_logits, dn_out_toproi_simcc_y_logits, dn_out_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None
 
             if dn_pre_hidden is not None:
-                dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits = self._predict_point_branch(
+                dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits = self._predict_point_branch(
                     dn_pre_hidden,
                     dn_pre_bboxes,
+                    dn_pre_logits,
                     proj_feats,
                     self.pre_picking_head,
                     self.pre_picking_offset_head,
                     self.pre_point_quality_head,
+                    self.pre_point_selector_head,
+                    self.pre_point_accept_head,
+                    self.pre_weak_heatmap_head,
+                    self.pre_toproi_simcc_x_head,
+                    self.pre_toproi_simcc_y_head,
+                    None,
                     self.pre_point_local_proj,
                     self.pre_point_full_local_proj,
                     self.pre_point_top_local_proj,
@@ -1440,14 +1878,20 @@ class DFINETransformer(nn.Module):
                     roi_boxes_cxcywh=dn_teacher_roi_boxes,
                 )
             else:
-                dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits = None, None, None
+                dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None
         else:
             out_picking_logits = None
             out_picking_offsets = None
             out_point_quality_logits = None
-            dn_out_picking_logits, dn_out_picking_offsets, dn_out_point_quality_logits = None, None, None
-            pre_picking_logits, pre_picking_offsets, pre_point_quality_logits = None, None, None
-            dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits = None, None, None
+            out_point_selector_logits = None
+            out_point_accept_logits = None
+            out_weak_heatmap_logits = None
+            out_toproi_simcc_x_logits = None
+            out_toproi_simcc_y_logits = None
+            out_toproi_heatmap_logits = None
+            dn_out_picking_logits, dn_out_picking_offsets, dn_out_point_quality_logits, dn_out_point_selector_logits, dn_out_point_accept_logits, dn_out_weak_heatmap_logits, dn_out_toproi_simcc_x_logits, dn_out_toproi_simcc_y_logits, dn_out_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None
+            pre_picking_logits, pre_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None
+            dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None
 
 
         if self.training:
@@ -1461,6 +1905,17 @@ class DFINETransformer(nn.Module):
             out['pred_picking_offsets'] = out_picking_offsets[-1]
             if out_point_quality_logits is not None:
                 out['pred_point_quality'] = out_point_quality_logits[-1]
+            if out_point_selector_logits is not None:
+                out['pred_point_selector'] = out_point_selector_logits[-1]
+            if out_point_accept_logits is not None:
+                out['pred_point_accept'] = out_point_accept_logits[-1]
+            if out_weak_heatmap_logits is not None:
+                out['pred_weak_heatmap_score'] = out_weak_heatmap_logits[-1]
+            if out_toproi_simcc_x_logits is not None and out_toproi_simcc_y_logits is not None:
+                out['pred_toproi_simcc_x'] = out_toproi_simcc_x_logits[-1]
+                out['pred_toproi_simcc_y'] = out_toproi_simcc_y_logits[-1]
+            if out_toproi_heatmap_logits is not None:
+                out['pred_toproi_heatmap'] = out_toproi_heatmap_logits[-1]
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss2(
@@ -1473,6 +1928,12 @@ class DFINETransformer(nn.Module):
                 out_picking_logits[:-1] if out_picking_logits is not None else None,
                 out_picking_offsets[:-1] if out_picking_offsets is not None else None,
                 out_point_quality_logits[:-1] if out_point_quality_logits is not None else None,
+                out_point_selector_logits[:-1] if out_point_selector_logits is not None else None,
+                out_point_accept_logits[:-1] if out_point_accept_logits is not None else None,
+                out_weak_heatmap_logits[:-1] if out_weak_heatmap_logits is not None else None,
+                out_toproi_simcc_x_logits[:-1] if out_toproi_simcc_x_logits is not None else None,
+                out_toproi_simcc_y_logits[:-1] if out_toproi_simcc_y_logits is not None else None,
+                None,
             )
             out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
             out['pre_outputs'] = {'pred_logits': pre_logits, 'pred_boxes': pre_bboxes}
@@ -1481,6 +1942,17 @@ class DFINETransformer(nn.Module):
                 out['pre_outputs']['pred_picking_offsets'] = pre_picking_offsets
                 if pre_point_quality_logits is not None:
                     out['pre_outputs']['pred_point_quality'] = pre_point_quality_logits
+                if pre_point_selector_logits is not None:
+                    out['pre_outputs']['pred_point_selector'] = pre_point_selector_logits
+                if pre_point_accept_logits is not None:
+                    out['pre_outputs']['pred_point_accept'] = pre_point_accept_logits
+                if pre_weak_heatmap_logits is not None:
+                    out['pre_outputs']['pred_weak_heatmap_score'] = pre_weak_heatmap_logits
+                if pre_toproi_simcc_x_logits is not None and pre_toproi_simcc_y_logits is not None:
+                    out['pre_outputs']['pred_toproi_simcc_x'] = pre_toproi_simcc_x_logits
+                    out['pre_outputs']['pred_toproi_simcc_y'] = pre_toproi_simcc_y_logits
+                if pre_toproi_heatmap_logits is not None:
+                    out['pre_outputs']['pred_toproi_heatmap'] = pre_toproi_heatmap_logits
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
 
             if dn_meta is not None:
@@ -1494,6 +1966,12 @@ class DFINETransformer(nn.Module):
                     dn_out_picking_logits,
                     dn_out_picking_offsets,
                     dn_out_point_quality_logits,
+                    dn_out_point_selector_logits,
+                    dn_out_point_accept_logits,
+                    dn_out_weak_heatmap_logits,
+                    dn_out_toproi_simcc_x_logits,
+                    dn_out_toproi_simcc_y_logits,
+                    None,
                 )
                 out['dn_pre_outputs'] = {'pred_logits': dn_pre_logits, 'pred_boxes': dn_pre_bboxes}
                 if dn_pre_picking_logits is not None:
@@ -1501,6 +1979,17 @@ class DFINETransformer(nn.Module):
                     out['dn_pre_outputs']['pred_picking_offsets'] = dn_pre_picking_offsets
                     if dn_pre_point_quality_logits is not None:
                         out['dn_pre_outputs']['pred_point_quality'] = dn_pre_point_quality_logits
+                    if dn_pre_point_selector_logits is not None:
+                        out['dn_pre_outputs']['pred_point_selector'] = dn_pre_point_selector_logits
+                    if dn_pre_point_accept_logits is not None:
+                        out['dn_pre_outputs']['pred_point_accept'] = dn_pre_point_accept_logits
+                    if dn_pre_weak_heatmap_logits is not None:
+                        out['dn_pre_outputs']['pred_weak_heatmap_score'] = dn_pre_weak_heatmap_logits
+                    if dn_pre_toproi_simcc_x_logits is not None and dn_pre_toproi_simcc_y_logits is not None:
+                        out['dn_pre_outputs']['pred_toproi_simcc_x'] = dn_pre_toproi_simcc_x_logits
+                        out['dn_pre_outputs']['pred_toproi_simcc_y'] = dn_pre_toproi_simcc_y_logits
+                    if dn_pre_toproi_heatmap_logits is not None:
+                        out['dn_pre_outputs']['pred_toproi_heatmap'] = dn_pre_toproi_heatmap_logits
                 out['dn_meta'] = dn_meta
 
         return out
@@ -1514,6 +2003,12 @@ class DFINETransformer(nn.Module):
         outputs_picking_logits=None,
         outputs_picking_offsets=None,
         outputs_point_quality_logits=None,
+        outputs_point_selector_logits=None,
+        outputs_point_accept_logits=None,
+        outputs_weak_heatmap_logits=None,
+        outputs_toproi_simcc_x_logits=None,
+        outputs_toproi_simcc_y_logits=None,
+        outputs_toproi_heatmap_logits=None,
     ):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
@@ -1527,6 +2022,17 @@ class DFINETransformer(nn.Module):
                 item['pred_picking_offsets'] = outputs_picking_offsets[idx]
             if outputs_point_quality_logits is not None:
                 item['pred_point_quality'] = outputs_point_quality_logits[idx]
+            if outputs_point_selector_logits is not None:
+                item['pred_point_selector'] = outputs_point_selector_logits[idx]
+            if outputs_point_accept_logits is not None:
+                item['pred_point_accept'] = outputs_point_accept_logits[idx]
+            if outputs_weak_heatmap_logits is not None:
+                item['pred_weak_heatmap_score'] = outputs_weak_heatmap_logits[idx]
+            if outputs_toproi_simcc_x_logits is not None and outputs_toproi_simcc_y_logits is not None:
+                item['pred_toproi_simcc_x'] = outputs_toproi_simcc_x_logits[idx]
+                item['pred_toproi_simcc_y'] = outputs_toproi_simcc_y_logits[idx]
+            if outputs_toproi_heatmap_logits is not None:
+                item['pred_toproi_heatmap'] = outputs_toproi_heatmap_logits[idx]
             results.append(item)
         return results
 
@@ -1535,7 +2041,13 @@ class DFINETransformer(nn.Module):
     def _set_aux_loss2(self, outputs_class, outputs_coord, outputs_corners, outputs_ref,
                        teacher_corners=None, teacher_logits=None,
                        outputs_picking_logits=None, outputs_picking_offsets=None,
-                       outputs_point_quality_logits=None):
+                       outputs_point_quality_logits=None,
+                       outputs_point_selector_logits=None,
+                       outputs_point_accept_logits=None,
+                       outputs_weak_heatmap_logits=None,
+                       outputs_toproi_simcc_x_logits=None,
+                       outputs_toproi_simcc_y_logits=None,
+                       outputs_toproi_heatmap_logits=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
@@ -1555,5 +2067,16 @@ class DFINETransformer(nn.Module):
                 item['pred_picking_offsets'] = outputs_picking_offsets[idx]
             if outputs_point_quality_logits is not None:
                 item['pred_point_quality'] = outputs_point_quality_logits[idx]
+            if outputs_point_selector_logits is not None:
+                item['pred_point_selector'] = outputs_point_selector_logits[idx]
+            if outputs_point_accept_logits is not None:
+                item['pred_point_accept'] = outputs_point_accept_logits[idx]
+            if outputs_weak_heatmap_logits is not None:
+                item['pred_weak_heatmap_score'] = outputs_weak_heatmap_logits[idx]
+            if outputs_toproi_simcc_x_logits is not None and outputs_toproi_simcc_y_logits is not None:
+                item['pred_toproi_simcc_x'] = outputs_toproi_simcc_x_logits[idx]
+                item['pred_toproi_simcc_y'] = outputs_toproi_simcc_y_logits[idx]
+            if outputs_toproi_heatmap_logits is not None:
+                item['pred_toproi_heatmap'] = outputs_toproi_heatmap_logits[idx]
             results.append(item)
         return results

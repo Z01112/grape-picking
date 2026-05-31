@@ -52,6 +52,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-label", default="baseline_replay")
     parser.add_argument("--report-title", default="grape point 实验中文结论")
     parser.add_argument("--change-note", action="append", default=None)
+    parser.add_argument(
+        "--save-prediction-records",
+        action="store_true",
+        help="Save train/valid/test prediction records for later no-checkpoint offline sweeps.",
+    )
     return parser.parse_args()
 
 
@@ -356,9 +361,12 @@ def structured_split_summary(stats: dict, cfg: dict, error_summary: dict | None 
             "mean_l2_px": flat["point_mean_l2_px"],
             "median_l2_px": safe_float(error_summary.get("median_l2_px"), float("nan")),
             "p90_l2_px": safe_float(error_summary.get("p90_l2_px"), float("nan")),
+            "ppl_sr_30": safe_float(error_summary.get("ppl_sr_30"), float("nan")),
+            "ppl_sr_50": safe_float(error_summary.get("ppl_sr_50"), float("nan")),
             "mean_abs_dx_px": safe_float(error_summary.get("mean_abs_dx_px"), float("nan")),
             "mean_abs_dy_px": safe_float(error_summary.get("mean_abs_dy_px"), float("nan")),
             "size_group_l2_px": error_summary.get("size_group_l2_px", {}),
+            "quality_aligned": error_summary.get("quality_aligned"),
         },
         "composite_score": flat["composite_score"],
     }
@@ -400,10 +408,31 @@ def _prediction_to_instances(prediction: dict) -> list[dict]:
     scores = prediction.get("scores", torch.zeros((boxes.shape[0],))).detach().cpu().to(torch.float32)
     labels = prediction.get("labels", torch.zeros((boxes.shape[0],), dtype=torch.int64)).detach().cpu()
     has_scores = prediction.get("has_picking_scores")
+    quality_scores = prediction.get("point_quality_scores")
+    final_scores = prediction.get("point_final_scores")
+    selector_scores = prediction.get("point_selector_scores")
+    selector_final_scores = prediction.get("point_selector_final_scores")
+    accept_scores = prediction.get("point_accept_scores")
+    accept_final_scores = prediction.get("point_accept_final_scores")
+    weak_heatmap_scores = prediction.get("weak_heatmap_scores")
     if has_scores is None:
         has_scores = torch.zeros((boxes.shape[0],), dtype=torch.float32)
     else:
         has_scores = has_scores.detach().cpu().to(torch.float32)
+    if quality_scores is not None:
+        quality_scores = quality_scores.detach().cpu().to(torch.float32)
+    if final_scores is not None:
+        final_scores = final_scores.detach().cpu().to(torch.float32)
+    if selector_scores is not None:
+        selector_scores = selector_scores.detach().cpu().to(torch.float32)
+    if selector_final_scores is not None:
+        selector_final_scores = selector_final_scores.detach().cpu().to(torch.float32)
+    if accept_scores is not None:
+        accept_scores = accept_scores.detach().cpu().to(torch.float32)
+    if accept_final_scores is not None:
+        accept_final_scores = accept_final_scores.detach().cpu().to(torch.float32)
+    if weak_heatmap_scores is not None:
+        weak_heatmap_scores = weak_heatmap_scores.detach().cpu().to(torch.float32)
     points = prediction.get("picking_points")
     if points is None:
         points = torch.zeros((boxes.shape[0], 2), dtype=torch.float32)
@@ -412,15 +441,28 @@ def _prediction_to_instances(prediction: dict) -> list[dict]:
 
     instances = []
     for idx in range(boxes.shape[0]):
-        instances.append(
-            {
-                "bbox_xyxy": [float(v) for v in boxes[idx].tolist()],
-                "score": float(scores[idx].item()),
-                "label": int(labels[idx].item()),
-                "has_picking_score": float(has_scores[idx].item()),
-                "picking_point": [float(v) for v in points[idx].tolist()],
-            }
-        )
+        item = {
+            "bbox_xyxy": [float(v) for v in boxes[idx].tolist()],
+            "score": float(scores[idx].item()),
+            "label": int(labels[idx].item()),
+            "has_picking_score": float(has_scores[idx].item()),
+            "picking_point": [float(v) for v in points[idx].tolist()],
+        }
+        if quality_scores is not None:
+            item["point_quality_score"] = float(quality_scores[idx].item())
+        if final_scores is not None:
+            item["point_final_score"] = float(final_scores[idx].item())
+        if selector_scores is not None:
+            item["point_selector_score"] = float(selector_scores[idx].item())
+        if selector_final_scores is not None:
+            item["point_selector_final_score"] = float(selector_final_scores[idx].item())
+        if accept_scores is not None:
+            item["point_accept_score"] = float(accept_scores[idx].item())
+        if accept_final_scores is not None:
+            item["point_accept_final_score"] = float(accept_final_scores[idx].item())
+        if weak_heatmap_scores is not None:
+            item["weak_heatmap_score"] = float(weak_heatmap_scores[idx].item())
+        instances.append(item)
     return instances
 
 
@@ -502,7 +544,12 @@ def evaluate_split(
     return stats, records
 
 
-def match_prediction_record(record: dict, iou_threshold: float, has_picking_threshold: float) -> dict:
+def match_prediction_record(
+    record: dict,
+    iou_threshold: float,
+    has_picking_threshold: float,
+    visibility_score_key: str = "has_picking_score",
+) -> dict:
     gt_entries = record.get("gt_instances", [])
     pred_entries = record.get("pred_instances", [])
     output = {
@@ -537,7 +584,7 @@ def match_prediction_record(record: dict, iou_threshold: float, has_picking_thre
         gt = gt_entries[best_gt]
         pred = pred_entries[pred_idx]
         gt_visible = bool(gt["has_picking"])
-        pred_visible = bool(float(pred.get("has_picking_score", 0.0)) >= has_picking_threshold)
+        pred_visible = bool(float(pred.get(visibility_score_key, 0.0)) >= has_picking_threshold)
         case = _build_point_case(record, best_gt, gt, pred_idx, pred, best_iou)
         case.update(
             {
@@ -558,10 +605,15 @@ def match_prediction_record(record: dict, iou_threshold: float, has_picking_thre
     return output
 
 
-def collect_case_groups(records: list[dict], iou_threshold: float, has_picking_threshold: float) -> tuple[list[dict], list[dict], list[dict]]:
+def collect_case_groups(
+    records: list[dict],
+    iou_threshold: float,
+    has_picking_threshold: float,
+    visibility_score_key: str = "has_picking_score",
+) -> tuple[list[dict], list[dict], list[dict]]:
     correct_pairs, fp_pairs, fn_pairs = [], [], []
     for record in records:
-        matched = match_prediction_record(record, iou_threshold, has_picking_threshold)
+        matched = match_prediction_record(record, iou_threshold, has_picking_threshold, visibility_score_key=visibility_score_key)
         correct_pairs.extend(matched["correct_visible_pairs"])
         fp_pairs.extend(matched["has_fp_pairs"])
         fn_pairs.extend(matched["has_fn_pairs"])
@@ -595,6 +647,11 @@ def _build_point_case(record: dict, gt_idx: int, gt: dict, pred_idx: int, pred: 
         "gt_point": gt_point,
         "pred_point": pred_point,
         "pred_has_picking_score": float(pred.get("has_picking_score", 0.0)),
+        "pred_point_quality_score": float(pred.get("point_quality_score", 0.0)),
+        "pred_point_final_score": float(pred.get("point_final_score", 0.0)),
+        "pred_point_accept_score": float(pred.get("point_accept_score", 0.0)),
+        "pred_point_accept_final_score": float(pred.get("point_accept_final_score", 0.0)),
+        "pred_weak_heatmap_score": float(pred.get("weak_heatmap_score", 0.0)),
         "pred_score": float(pred.get("score", 0.0)),
         "dx_px": dx,
         "dy_px": dy,
@@ -687,8 +744,17 @@ def collect_cross_instance_mismatch_cases(records: list[dict], correct_pairs: li
     return mismatches
 
 
-def summarize_split_error(records: list[dict], has_picking_threshold: float) -> dict:
-    correct_pairs, fp_pairs, fn_pairs = collect_case_groups(records, 0.5, has_picking_threshold)
+def summarize_split_error(
+    records: list[dict],
+    has_picking_threshold: float,
+    visibility_score_key: str = "has_picking_score",
+) -> dict:
+    correct_pairs, fp_pairs, fn_pairs = collect_case_groups(
+        records,
+        0.5,
+        has_picking_threshold,
+        visibility_score_key=visibility_score_key,
+    )
     l2_values = [float(item["l2_px"]) for item in correct_pairs if "l2_px" in item]
     dx_values = [float(item["dx_px"]) for item in correct_pairs if "dx_px" in item]
     dy_values = [float(item["dy_px"]) for item in correct_pairs if "dy_px" in item]
@@ -711,6 +777,8 @@ def summarize_split_error(records: list[dict], has_picking_threshold: float) -> 
         "mean_l2_px": float(np.mean(l2_values)) if l2_values else 0.0,
         "median_l2_px": float(np.median(l2_values)) if l2_values else 0.0,
         "p90_l2_px": float(np.quantile(np.asarray(l2_values), 0.90)) if l2_values else 0.0,
+        "ppl_sr_30": float(np.mean(np.asarray(l2_values) <= 30.0)) if l2_values else 0.0,
+        "ppl_sr_50": float(np.mean(np.asarray(l2_values) <= 50.0)) if l2_values else 0.0,
         "mean_abs_dx_px": float(np.mean(np.abs(dx_values))) if dx_values else 0.0,
         "mean_abs_dy_px": float(np.mean(np.abs(dy_values))) if dy_values else 0.0,
         "has_picking_correct_count": len(correct_pairs),
@@ -1217,6 +1285,16 @@ def build_comparison_report_zh(
                 "",
             ]
         )
+    qa = primary_test.get("picking_point", {}).get("quality_aligned")
+    if qa:
+        lines.extend(
+            [
+                "## point quality 对齐口径",
+                f"- 使用 `has_picking_score * point_quality_score` 作为可采判断分数时，test pair_count / mean L2 / median L2 / p90 L2 = {int(qa.get('point_pair_count', qa.get('count', 0)))} / {safe_float(qa.get('mean_l2_px')):.2f} / {safe_float(qa.get('median_l2_px')):.2f} / {safe_float(qa.get('p90_l2_px')):.2f} px。",
+                "- 该口径只用于判断质量头是否能过滤低质量点，不替代默认 has_picking 主评估口径。",
+                "",
+            ]
+        )
     if bbox_summary is not None:
         bbox_grape_ap = safe_float(bbox_summary.get("test_eval", {}).get("per_class", {}).get("grape", {}).get("AP"))
         lines.extend(
@@ -1316,7 +1394,20 @@ def main() -> None:
         )
         primary_split_stats[split] = stats
         primary_split_records[split] = records
+        if args.save_prediction_records:
+            records_path = args.report_dir / f"{split}_prediction_records.json"
+            records_path.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
         primary_split_error[split] = summarize_split_error(records, has_picking_threshold)
+        if any(
+            "point_final_score" in pred
+            for record in records
+            for pred in record.get("pred_instances", [])
+        ):
+            primary_split_error[split]["quality_aligned"] = summarize_split_error(
+                records,
+                has_picking_threshold,
+                visibility_score_key="point_final_score",
+            )
         primary_split_decoupled[split] = summarize_decoupled_point_diagnostics(records, has_picking_threshold)
 
     checkpoint_metrics = {}
