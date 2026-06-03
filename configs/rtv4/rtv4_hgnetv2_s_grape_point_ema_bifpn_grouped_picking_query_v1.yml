@@ -1,0 +1,41 @@
+__include__: [
+  ./rtv4_hgnetv2_s_grape_point_enc_ema_bifpn_weighted_fusion.yml
+]
+
+output_dir: ./outputs/24_grouped_picking_query/ema_bifpn_grouped_picking_query_v1_probe20
+epoches: 20
+
+optimizer:
+  type: AdamW
+  params:
+    - params: ^(?=.*backbone)(?!.*bn).*$
+      lr: 0.0000125
+    - params: ^(?=.*(?:norm|bn)).*$
+      weight_decay: 0.0
+  lr: 0.000025
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+DFINETransformer:
+  use_grouped_picking_query: true
+  grouped_picking_query_hidden_scale: 1.0
+  grouped_picking_use_toproi: true
+  grouped_picking_use_box_geometry: true
+  grouped_picking_residual_offset: false
+
+PostProcessor:
+  use_grouped_picking_offsets: true
+
+RTv4Criterion:
+  weight_dict:
+    loss_vfl: 1
+    loss_bbox: 5
+    loss_giou: 2
+    loss_fgl: 0.15
+    loss_ddf: 1.5
+    loss_mal: 1
+    loss_distill: 10.0
+    loss_has_picking: 1.2
+    loss_picking_offset: 4.0
+    loss_grouped_picking_offset: 4.0
+  losses: [mal, boxes, local, has_picking, picking_offset, grouped_picking_offset]

@@ -44,6 +44,13 @@ class YAMLConfig(BaseConfig):
     def model(self, ) -> torch.nn.Module:
         if self._model is None and 'model' in self.yaml_cfg:
             self._model = create(self.yaml_cfg['model'], self.global_cfg)
+            trainable_keywords = self.yaml_cfg.get('trainable_keywords')
+            if trainable_keywords:
+                if isinstance(trainable_keywords, str):
+                    trainable_keywords = [trainable_keywords]
+                trainable_keywords = [str(keyword) for keyword in trainable_keywords]
+                for name, param in self._model.named_parameters():
+                    param.requires_grad = any(keyword in name for keyword in trainable_keywords)
         return super().model
 
     @property

@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict
 import atexit
+import copy
 
 from ..misc import dist_utils
 from ..core import BaseConfig
@@ -62,6 +63,16 @@ class BaseSolver(object):
             print(f'Tuning checkpoint from {self.cfg.tuning}')
             self.load_tuning_state(self.cfg.tuning)
 
+        self.has_logit_teacher_model = None
+        has_teacher_cfg = getattr(self.cfg, "yaml_cfg", {}).get("has_logit_distill_teacher", None)
+        if has_teacher_cfg and bool(has_teacher_cfg.get("enabled", False)):
+            self.has_logit_teacher_model = copy.deepcopy(self.model)
+            self.has_logit_teacher_model.eval()
+            for param in self.has_logit_teacher_model.parameters():
+                param.requires_grad_(False)
+            self.has_logit_teacher_model = self.has_logit_teacher_model.to(device)
+            print("Initialized frozen has-logit distillation teacher from current tuned model state.")
+
         self.model = dist_utils.warp_model(
             self.model.to(device), sync_bn=cfg.sync_bn, find_unused_parameters=cfg.find_unused_parameters
         )
@@ -107,6 +118,16 @@ class BaseSolver(object):
         if self.cfg.resume:
             print(f'Resume checkpoint from {self.cfg.resume}')
             self.load_resume_state(self.cfg.resume)
+            if self.has_logit_teacher_model is not None and self.cfg.tuning:
+                module = dist_utils.de_parallel(self.has_logit_teacher_model)
+                if self.cfg.tuning.startswith('http'):
+                    state = torch.hub.load_state_dict_from_url(self.cfg.tuning, map_location='cpu')
+                else:
+                    state = torch.load(self.cfg.tuning, map_location='cpu')
+                teacher_state = state['ema']['module'] if 'ema' in state else state['model']
+                matched, infos = self._matched_state(module.state_dict(), teacher_state)
+                module.load_state_dict(matched, strict=False)
+                print(f'Restored frozen has-logit teacher from tuning checkpoint, {infos}')
 
     def eval(self):
         self._setup()

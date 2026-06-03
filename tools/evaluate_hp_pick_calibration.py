@@ -470,6 +470,18 @@ def write_markdown(
     lines.extend(
         [
             "",
+            "## Protocol Semantics",
+            "",
+            f"- selected_protocol_kind: `{selected_test.get('kind')}`",
+            f"- whether_point_coordinates_changed: `{int(selected_test.get('changed_predictions', 0)) > 0}`",
+            f"- whether_visibility_score_changed: `{selected_test.get('kind') in {'geom_score', 'hybrid_clamp_geom'}}`",
+            "- whether_box_ap_unchanged: `true`",
+            (
+                "- protocol meaning: threshold-only calibration, no coordinate modification."
+                if selected_test.get("kind") == "raw"
+                else "- protocol meaning: geometry post-processing protocol; `changed_predictions` records modified points."
+            ),
+            "",
             "## Gate Result",
             "",
             f"- Mainline gate: {'PASS' if gate['passed'] else 'FAIL'}",
@@ -591,6 +603,16 @@ def main() -> int:
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "config": str(args.config.resolve()),
         "checkpoint": str(args.checkpoint.resolve()),
+        "selected_protocol_kind": selected_test.get("kind"),
+        "whether_point_coordinates_changed": int(selected_test.get("changed_predictions", 0)) > 0,
+        "whether_visibility_score_changed": selected_test.get("kind") in {"geom_score", "hybrid_clamp_geom"},
+        "whether_box_ap_unchanged": True,
+        "selected_protocol_description": (
+            "threshold-only calibration, no coordinate modification"
+            if selected_test.get("kind") == "raw"
+            else "geometry post-processing protocol"
+        ),
+        "changed_predictions": int(selected_test.get("changed_predictions", 0)),
         "main_reference": main_ref,
         "base_reference": base_ref,
         "selected_valid": selected_valid,

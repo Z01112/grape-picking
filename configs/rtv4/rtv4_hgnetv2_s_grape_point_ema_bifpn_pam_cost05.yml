@@ -1,0 +1,36 @@
+__include__: [
+  ./rtv4_hgnetv2_s_grape_point_enc_ema_bifpn_weighted_fusion.yml
+]
+
+output_dir: ./outputs/14_point_aware_matching/pam_cost05_probe30
+epoches: 30
+
+optimizer:
+  type: AdamW
+  params:
+    - params: ^(?=.*backbone)(?!.*bn).*$
+      lr: 0.000025
+    - params: ^(?=.*(?:norm|bn)).*$
+      weight_decay: 0.0
+  lr: 0.00005
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+RTv4Criterion:
+  matcher:
+    type: HungarianMatcher
+    weight_dict:
+      cost_class: 2
+      cost_bbox: 5
+      cost_giou: 2
+    alpha: 0.25
+    gamma: 2.0
+    use_point_cost: true
+    cost_point: 0.5
+    point_cost_type: l1
+    point_cost_visible_only: true
+    point_cost_normalized: true
+    point_cost_start_epoch: 0
+    point_cost_warmup_epochs: 0
+    point_anchor_mode: top_center
+    point_top_anchor_ratio: 0.12

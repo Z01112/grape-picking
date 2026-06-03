@@ -27,6 +27,11 @@ from engine.core.yaml_utils import load_config
 from engine.misc import MetricLogger, dist_utils
 from engine.rtv4.box_ops import box_iou
 from engine.solver import TASKS
+from tools.grape_point_eval_utils import (
+    build_records_from_coco,
+    compute_unified_point_metrics,
+    prediction_to_instances,
+)
 
 
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "rtv4" / "rtv4_hgnetv2_s_grape_point_baseline_replay.yml"
@@ -414,6 +419,8 @@ def _prediction_to_instances(prediction: dict) -> list[dict]:
     selector_final_scores = prediction.get("point_selector_final_scores")
     accept_scores = prediction.get("point_accept_scores")
     accept_final_scores = prediction.get("point_accept_final_scores")
+    reliability_scores = prediction.get("point_reliability_scores")
+    reliability_final_scores = prediction.get("point_reliability_final_scores")
     weak_heatmap_scores = prediction.get("weak_heatmap_scores")
     if has_scores is None:
         has_scores = torch.zeros((boxes.shape[0],), dtype=torch.float32)
@@ -431,6 +438,10 @@ def _prediction_to_instances(prediction: dict) -> list[dict]:
         accept_scores = accept_scores.detach().cpu().to(torch.float32)
     if accept_final_scores is not None:
         accept_final_scores = accept_final_scores.detach().cpu().to(torch.float32)
+    if reliability_scores is not None:
+        reliability_scores = reliability_scores.detach().cpu().to(torch.float32)
+    if reliability_final_scores is not None:
+        reliability_final_scores = reliability_final_scores.detach().cpu().to(torch.float32)
     if weak_heatmap_scores is not None:
         weak_heatmap_scores = weak_heatmap_scores.detach().cpu().to(torch.float32)
     points = prediction.get("picking_points")
@@ -460,6 +471,10 @@ def _prediction_to_instances(prediction: dict) -> list[dict]:
             item["point_accept_score"] = float(accept_scores[idx].item())
         if accept_final_scores is not None:
             item["point_accept_final_score"] = float(accept_final_scores[idx].item())
+        if reliability_scores is not None:
+            item["point_reliability_score"] = float(reliability_scores[idx].item())
+        if reliability_final_scores is not None:
+            item["point_reliability_final_score"] = float(reliability_final_scores[idx].item())
         if weak_heatmap_scores is not None:
             item["weak_heatmap_score"] = float(weak_heatmap_scores[idx].item())
         instances.append(item)
@@ -511,7 +526,7 @@ def evaluate_split(
             evaluator.cleanup()
             metric_logger = MetricLogger(delimiter="  ")
             header = f"Eval-{split}:"
-            records_by_image = _build_gt_by_image(evaluator.coco_gt.dataset, split_dir)
+            records_by_image = build_records_from_coco(evaluator.coco_gt.dataset, split_dir)
 
             for samples, targets in metric_logger.log_every(data_loader, 10, header):
                 samples = samples.to(eval_device)
@@ -525,7 +540,7 @@ def evaluate_split(
                 if collect_predictions:
                     for image_id, output in results_map.items():
                         if image_id in records_by_image:
-                            records_by_image[image_id]["pred_instances"] = _prediction_to_instances(output)
+                            records_by_image[image_id]["pred_instances"] = prediction_to_instances(output)
 
             metric_logger.synchronize_between_processes()
             evaluator.synchronize_between_processes()
@@ -651,6 +666,8 @@ def _build_point_case(record: dict, gt_idx: int, gt: dict, pred_idx: int, pred: 
         "pred_point_final_score": float(pred.get("point_final_score", 0.0)),
         "pred_point_accept_score": float(pred.get("point_accept_score", 0.0)),
         "pred_point_accept_final_score": float(pred.get("point_accept_final_score", 0.0)),
+        "pred_point_reliability_score": float(pred.get("point_reliability_score", 0.0)),
+        "pred_point_reliability_final_score": float(pred.get("point_reliability_final_score", 0.0)),
         "pred_weak_heatmap_score": float(pred.get("weak_heatmap_score", 0.0)),
         "pred_score": float(pred.get("score", 0.0)),
         "dx_px": dx,
@@ -1239,6 +1256,7 @@ def build_comparison_report_zh(
     reference_summary: dict | None,
     bbox_summary: dict | None,
     test_decoupled_summary: dict | None = None,
+    test_unified_metrics: dict | None = None,
     report_title: str = "point 实验中文结论",
     primary_label: str = "point_run",
     reference_label: str = "point_v2",
@@ -1292,6 +1310,40 @@ def build_comparison_report_zh(
                 "## point quality 对齐口径",
                 f"- 使用 `has_picking_score * point_quality_score` 作为可采判断分数时，test pair_count / mean L2 / median L2 / p90 L2 = {int(qa.get('point_pair_count', qa.get('count', 0)))} / {safe_float(qa.get('mean_l2_px')):.2f} / {safe_float(qa.get('median_l2_px')):.2f} / {safe_float(qa.get('p90_l2_px')):.2f} px。",
                 "- 该口径只用于判断质量头是否能过滤低质量点，不替代默认 has_picking 主评估口径。",
+                "",
+            ]
+        )
+    if test_unified_metrics is not None:
+        instance = test_unified_metrics.get("instance_chain", {})
+        global_chain = test_unified_metrics.get("global_chain", {})
+        lines.extend(
+            [
+                "## 统一采摘点评估口径",
+                "",
+                (
+                    "| chain | instance_f1 | global_visible_recall | global_f1 | visible GT | "
+                    "pair_count | mean_L2 | PPL-SR@30 | PPL-SR@50 |"
+                ),
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+                (
+                    f"| instance-chain | {safe_float(instance.get('instance_visible_f1')):.4f} | "
+                    f"{safe_float(global_chain.get('global_visible_recall')):.4f} | "
+                    f"{safe_float(global_chain.get('global_visible_f1')):.4f} | "
+                    f"{int(instance.get('visible_gt_total', 0))} | {int(instance.get('point_pair_count', 0))} | "
+                    f"{safe_float(instance.get('point_mean_l2_px')):.2f} | "
+                    f"{safe_float(instance.get('ppl_sr_30')):.4f} | {safe_float(instance.get('ppl_sr_50')):.4f} |"
+                ),
+                (
+                    f"| global-chain | {safe_float(instance.get('instance_visible_f1')):.4f} | "
+                    f"{safe_float(global_chain.get('global_visible_recall')):.4f} | "
+                    f"{safe_float(global_chain.get('global_visible_f1')):.4f} | "
+                    f"{int(global_chain.get('visible_gt_total', 0))} | {int(instance.get('point_pair_count', 0))} | "
+                    f"{safe_float(instance.get('point_mean_l2_px')):.2f} | "
+                    f"{safe_float(instance.get('ppl_sr_30')):.4f} | {safe_float(instance.get('ppl_sr_50')):.4f} |"
+                ),
+                "",
+                "- instance-chain 对应旧 GPPoint-DETR 口径：先 IoU50 匹配 grape，再评价 visible 判断和点误差。",
+                "- global-chain 把所有 visible GT 作为召回分母，precision 仍在 IoU50 instance chain 上计算，避免 DETR top-query 数量影响横向比较。",
                 "",
             ]
         )
@@ -1380,6 +1432,7 @@ def main() -> None:
     primary_split_records = {}
     primary_split_error = {}
     primary_split_decoupled = {}
+    primary_split_unified = {}
     has_picking_threshold = safe_float(config_payload.get("PostProcessor", {}).get("has_picking_threshold", 0.5), 0.5)
     for split in ("train", "valid", "test"):
         stats, records = evaluate_split(
@@ -1398,6 +1451,12 @@ def main() -> None:
             records_path = args.report_dir / f"{split}_prediction_records.json"
             records_path.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
         primary_split_error[split] = summarize_split_error(records, has_picking_threshold)
+        primary_split_unified[split] = compute_unified_point_metrics(
+            records,
+            iou_threshold=0.5,
+            has_picking_threshold=has_picking_threshold,
+            visibility_score_key="visible_score",
+        )
         if any(
             "point_final_score" in pred
             for record in records
@@ -1506,6 +1565,7 @@ def main() -> None:
             "bbox_baseline": bbox_summary,
         },
         "split_error_summary": primary_split_error,
+        "unified_point_metrics": primary_split_unified,
         "decoupled_point_summary": primary_split_decoupled,
         "qualitative_cases": qualitative_summary,
         "error_analysis": error_summary,
@@ -1521,6 +1581,7 @@ def main() -> None:
         point_v2_summary,
         bbox_summary,
         test_decoupled_summary=primary_split_decoupled.get("test"),
+        test_unified_metrics=primary_split_unified.get("test"),
         report_title=args.report_title,
         primary_label=args.primary_label,
         reference_label=args.reference_label,

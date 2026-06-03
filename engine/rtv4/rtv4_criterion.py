@@ -80,6 +80,11 @@ class RTv4Criterion(nn.Module):
                   point_accept_topk=16,
                   point_accept_offset_mode='center',
                   point_accept_top_anchor_ratio=0.0,
+                  point_reliability_target='binary_ppl30',
+                  point_reliability_tau=30.0,
+                  point_reliability_invisible_weight=0.25,
+                  point_reliability_offset_mode='center',
+                  point_reliability_top_anchor_ratio=0.0,
                   weak_heatmap_sigma_px=30.0,
                   weak_heatmap_offset_mode='center',
                   weak_heatmap_top_anchor_ratio=0.0,
@@ -98,6 +103,15 @@ class RTv4Criterion(nn.Module):
                   point_o2m_aux_topk=2,
                   point_o2m_aux_has_weight=0.20,
                   point_o2m_aux_offset_weight=0.50,
+                  use_point_lsd=False,
+                  point_lsd_min_improve_px=3.0,
+                  point_lsd_teacher_source='best_layer',
+                  point_lsd_loss_type='smooth_l1',
+                  point_lsd_weight=0.05,
+                  point_lsd_offset_mode='top_center',
+                  point_lsd_top_anchor_ratio=0.12,
+                  point_lsd_anchor_x_ratio=0.5,
+                  has_logit_distill_loss_type='mse',
                   ):
         """Create the criterion.
         Parameters:
@@ -160,6 +174,13 @@ class RTv4Criterion(nn.Module):
         self.point_accept_topk = max(int(point_accept_topk), 1)
         self.point_accept_offset_mode = str(point_accept_offset_mode)
         self.point_accept_top_anchor_ratio = float(point_accept_top_anchor_ratio)
+        self.point_reliability_target = str(point_reliability_target).strip().lower()
+        if self.point_reliability_target not in ('binary_ppl30', 'continuous_exp'):
+            raise ValueError(f"Unsupported point_reliability_target: {point_reliability_target}")
+        self.point_reliability_tau = max(float(point_reliability_tau), 1e-6)
+        self.point_reliability_invisible_weight = max(float(point_reliability_invisible_weight), 0.0)
+        self.point_reliability_offset_mode = str(point_reliability_offset_mode)
+        self.point_reliability_top_anchor_ratio = float(point_reliability_top_anchor_ratio)
         self.weak_heatmap_sigma_px = max(float(weak_heatmap_sigma_px), 1e-6)
         self.weak_heatmap_offset_mode = str(weak_heatmap_offset_mode)
         self.weak_heatmap_top_anchor_ratio = float(weak_heatmap_top_anchor_ratio)
@@ -186,6 +207,21 @@ class RTv4Criterion(nn.Module):
         self.point_o2m_aux_topk = max(int(point_o2m_aux_topk), 0)
         self.point_o2m_aux_has_weight = float(point_o2m_aux_has_weight)
         self.point_o2m_aux_offset_weight = float(point_o2m_aux_offset_weight)
+        self.use_point_lsd = bool(use_point_lsd)
+        self.point_lsd_min_improve_px = max(float(point_lsd_min_improve_px), 0.0)
+        self.point_lsd_teacher_source = str(point_lsd_teacher_source).strip().lower()
+        if self.point_lsd_teacher_source != 'best_layer':
+            raise ValueError(f"Unsupported point_lsd_teacher_source: {point_lsd_teacher_source}")
+        self.point_lsd_loss_type = str(point_lsd_loss_type).strip().lower()
+        if self.point_lsd_loss_type not in ('l1', 'smooth_l1', 'mse'):
+            raise ValueError(f"Unsupported point_lsd_loss_type: {point_lsd_loss_type}")
+        self.point_lsd_weight = float(point_lsd_weight)
+        self.point_lsd_offset_mode = str(point_lsd_offset_mode)
+        self.point_lsd_top_anchor_ratio = float(point_lsd_top_anchor_ratio)
+        self.point_lsd_anchor_x_ratio = float(point_lsd_anchor_x_ratio)
+        self.has_logit_distill_loss_type = str(has_logit_distill_loss_type).strip().lower()
+        if self.has_logit_distill_loss_type not in ('mse', 'smooth_l1'):
+            raise ValueError(f"Unsupported has_logit_distill_loss_type: {has_logit_distill_loss_type}")
         if 'loss_dense_has_picking' not in self.weight_dict and self.lambda_dense_has > 0.0:
             self.weight_dict['loss_dense_has_picking'] = self.lambda_dense_has
         if 'loss_dense_picking_offset' not in self.weight_dict and self.lambda_dense_point > 0.0:
@@ -195,7 +231,32 @@ class RTv4Criterion(nn.Module):
         if self.point_o2m_aux_enabled:
             self.weight_dict.setdefault('loss_point_o2m_has', self.point_o2m_aux_has_weight)
             self.weight_dict.setdefault('loss_point_o2m_offset', self.point_o2m_aux_offset_weight)
+        if self.use_point_lsd:
+            self.weight_dict.setdefault('loss_point_lsd', self.point_lsd_weight)
         self._dense_positive_cache = None
+
+
+    def loss_has_logit_distill(self, outputs, targets, indices, num_boxes, **kwargs):
+        student_logits = outputs.get('pred_has_picking')
+        teacher_outputs = kwargs.get('teacher_outputs')
+        teacher_logits = None
+        if isinstance(teacher_outputs, dict):
+            teacher_logits = teacher_outputs.get('pred_has_picking')
+        if student_logits is None:
+            anchor = outputs.get('pred_boxes')
+            if anchor is None:
+                return {'loss_has_logit_distill': torch.tensor(0.0, device=next(iter(outputs.values())).device)}
+            return {'loss_has_logit_distill': anchor.sum() * 0.0}
+        if teacher_logits is None:
+            return {'loss_has_logit_distill': student_logits.sum() * 0.0}
+        teacher_logits = teacher_logits.detach().to(device=student_logits.device, dtype=student_logits.dtype)
+        if teacher_logits.shape != student_logits.shape:
+            return {'loss_has_logit_distill': student_logits.sum() * 0.0}
+        if self.has_logit_distill_loss_type == 'smooth_l1':
+            loss = F.smooth_l1_loss(student_logits.float(), teacher_logits.float(), reduction='mean', beta=1.0)
+        else:
+            loss = F.mse_loss(student_logits.float(), teacher_logits.float(), reduction='mean')
+        return {'loss_has_logit_distill': loss}
 
 
     def loss_distillation(self, outputs, targets, indices, num_boxes, **kwargs):
@@ -420,13 +481,13 @@ class RTv4Criterion(nn.Module):
         loss = F.binary_cross_entropy_with_logits(src_logits, target_has_picking, reduction='mean')
         return {'loss_has_picking': loss}
 
-    def _gather_matched_point_examples(self, outputs, targets, indices):
+    def _gather_matched_point_examples(self, outputs, targets, indices, offset_key='pred_picking_offsets'):
         """Collect point targets for the same matched queries used by box loss."""
         idx = self._get_src_permutation_idx(indices)
-        src_offsets = outputs['pred_picking_offsets'][idx]
+        src_offsets = outputs[offset_key][idx]
         if src_offsets.numel() == 0:
-            empty = outputs['pred_picking_offsets'].new_zeros((0, 2))
-            empty_1 = outputs['pred_picking_offsets'].new_zeros((0,))
+            empty = outputs[offset_key].new_zeros((0, 2))
+            empty_1 = outputs[offset_key].new_zeros((0,))
             return empty, empty_1, empty, empty
 
         target_has_picking = torch.cat(
@@ -636,6 +697,161 @@ class RTv4Criterion(nn.Module):
 
         loss = (point_loss * sample_weights).sum() / max(int(valid.sum().item()), 1)
         return {'loss_picking_offset': loss}
+
+    def loss_grouped_picking_offset(self, outputs, targets, indices, num_boxes, **kwargs):
+        """Offset loss for the grouped single-keypoint picking query branch."""
+        if 'pred_grouped_picking_offsets' not in outputs:
+            return {}
+
+        src_offsets, target_has_picking, target_offsets, target_boxes = self._gather_matched_point_examples(
+            outputs,
+            targets,
+            indices,
+            offset_key='pred_grouped_picking_offsets',
+        )
+        if src_offsets.numel() == 0:
+            return {'loss_grouped_picking_offset': outputs['pred_grouped_picking_offsets'].sum() * 0.0}
+
+        valid = target_has_picking > 0.5
+        if not valid.any():
+            return {'loss_grouped_picking_offset': outputs['pred_grouped_picking_offsets'].sum() * 0.0}
+
+        point_loss = self.compute_point_loss(src_offsets[valid], target_offsets[valid])
+        coord_weights = torch.as_tensor(
+            [self.point_coord_weight_x, self.point_coord_weight_y],
+            dtype=point_loss.dtype,
+            device=point_loss.device,
+        ).view(1, 2)
+        point_loss = point_loss * coord_weights
+
+        sample_weights = torch.ones((int(valid.sum().item()), 1), dtype=point_loss.dtype, device=point_loss.device)
+        if self.point_small_grape_weight > 1.0 and self.point_small_grape_area_threshold > 0.0:
+            areas = (target_boxes[valid, 2] * target_boxes[valid, 3]).to(dtype=point_loss.dtype)
+            small_mask = areas <= self.point_small_grape_area_threshold
+            if small_mask.any():
+                sample_weights[small_mask] = self.point_small_grape_weight
+
+        loss = (point_loss * sample_weights).sum() / max(int(valid.sum().item()), 1)
+        return {'loss_grouped_picking_offset': loss}
+
+    def _matched_target_sizes(self, outputs, targets, indices, dtype, device):
+        target_sizes = []
+        for target, (_, j) in zip(targets, indices):
+            size = target.get('orig_size', target.get('size'))
+            if size is None:
+                size = outputs['pred_boxes'].new_tensor([1.0, 1.0])
+            size = size.to(device=device, dtype=dtype).view(1, 2).repeat(len(j), 1)
+            target_sizes.append(size)
+        if not target_sizes:
+            return outputs['pred_boxes'].new_zeros((0, 2), dtype=dtype, device=device)
+        return torch.cat(target_sizes, dim=0)
+
+    def _decode_layer_points_for_matched_queries(self, layer_outputs, idx, target_sizes):
+        boxes = layer_outputs['pred_boxes'][idx].to(dtype=target_sizes.dtype, device=target_sizes.device)
+        offsets = layer_outputs['pred_picking_offsets'][idx].to(dtype=target_sizes.dtype, device=target_sizes.device)
+        scale_xyxy = target_sizes.repeat(1, 2)
+        points = absolute_points_from_boxes_and_offsets(
+            boxes * scale_xyxy,
+            offsets,
+            mode=self.point_lsd_offset_mode,
+            top_anchor_ratio=self.point_lsd_top_anchor_ratio,
+            anchor_x_ratio=self.point_lsd_anchor_x_ratio,
+        )
+        return offsets, points
+
+    def _point_lsd_loss_raw(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if self.point_lsd_loss_type == 'l1':
+            return F.l1_loss(pred, target, reduction='none')
+        if self.point_lsd_loss_type == 'mse':
+            return F.mse_loss(pred, target, reduction='none')
+        return F.smooth_l1_loss(pred, target, reduction='none', beta=max(self.point_loss_beta, 1e-6))
+
+    def loss_point_lsd(self, outputs, targets, indices, num_boxes, **kwargs):
+        """Training-only best-layer point localization self-distillation.
+
+        The final matched visible query is supervised toward the detached
+        picking offset from the same query's best aux/pre/final layer only when
+        that layer is at least point_lsd_min_improve_px better in pixel L2.
+        """
+        if not self.use_point_lsd:
+            return {}
+        required = ('pred_picking_offsets', 'pred_boxes')
+        if any(key not in outputs for key in required):
+            return {}
+        aux_layers = [
+            item for item in outputs.get('aux_outputs', [])
+            if isinstance(item, dict) and all(key in item for key in required)
+        ]
+        pre = outputs.get('pre_outputs')
+        if isinstance(pre, dict) and all(key in pre for key in required):
+            aux_layers.append(pre)
+        if not aux_layers:
+            return {'loss_point_lsd': outputs['pred_picking_offsets'].sum() * 0.0}
+
+        idx = self._get_src_permutation_idx(indices)
+        final_offsets = outputs['pred_picking_offsets'][idx]
+        if final_offsets.numel() == 0:
+            return {'loss_point_lsd': outputs['pred_picking_offsets'].sum() * 0.0}
+
+        target_has_picking = torch.cat(
+            [t['has_picking'][j] for t, (_, j) in zip(targets, indices)],
+            dim=0,
+        ).to(dtype=final_offsets.dtype, device=final_offsets.device)
+        target_offsets = torch.cat(
+            [t['picking_offsets'][j] for t, (_, j) in zip(targets, indices)],
+            dim=0,
+        ).to(dtype=final_offsets.dtype, device=final_offsets.device)
+        target_boxes = torch.cat(
+            [t['boxes'][j] for t, (_, j) in zip(targets, indices)],
+            dim=0,
+        ).to(dtype=final_offsets.dtype, device=final_offsets.device)
+        target_sizes = self._matched_target_sizes(
+            outputs,
+            targets,
+            indices,
+            dtype=final_offsets.dtype,
+            device=final_offsets.device,
+        )
+
+        valid = target_has_picking > 0.5
+        if not valid.any():
+            return {'loss_point_lsd': outputs['pred_picking_offsets'].sum() * 0.0}
+
+        scale_xyxy = target_sizes.repeat(1, 2)
+        target_points = absolute_points_from_boxes_and_offsets(
+            target_boxes * scale_xyxy,
+            target_offsets,
+            mode=self.point_lsd_offset_mode,
+            top_anchor_ratio=self.point_lsd_top_anchor_ratio,
+            anchor_x_ratio=self.point_lsd_anchor_x_ratio,
+        )
+
+        layer_offsets = []
+        layer_l2 = []
+        for layer in [outputs] + aux_layers:
+            offsets, points = self._decode_layer_points_for_matched_queries(layer, idx, target_sizes)
+            layer_offsets.append(offsets)
+            layer_l2.append(torch.linalg.norm(points - target_points, ord=2, dim=-1))
+        offsets_stack = torch.stack(layer_offsets, dim=1)
+        l2_stack = torch.stack(layer_l2, dim=1)
+
+        final_l2 = l2_stack[:, 0]
+        best_l2, best_layer_idx = l2_stack.min(dim=1)
+        improve = final_l2 - best_l2
+        active = valid & (best_layer_idx > 0) & (improve >= self.point_lsd_min_improve_px)
+        if not active.any():
+            return {'loss_point_lsd': outputs['pred_picking_offsets'].sum() * 0.0}
+
+        row_idx = torch.arange(offsets_stack.shape[0], device=offsets_stack.device)
+        teacher_offsets = offsets_stack[row_idx, best_layer_idx].detach()
+        loss_raw = self._point_lsd_loss_raw(final_offsets[active], teacher_offsets[active])
+        coord_weights = torch.as_tensor(
+            [self.point_coord_weight_x, self.point_coord_weight_y],
+            dtype=loss_raw.dtype,
+            device=loss_raw.device,
+        ).view(1, 2)
+        loss = (loss_raw * coord_weights).sum() / max(int(active.sum().item()), 1)
+        return {'loss_point_lsd': loss}
 
     def loss_point_quality(self, outputs, targets, indices, num_boxes, **kwargs):
         """Quality calibration for visible matched picking points.
@@ -880,6 +1096,82 @@ class RTv4Criterion(nn.Module):
         if group_count == 0:
             return {'loss_point_accept': accept_logits.sum() * 0.0}
         return {'loss_point_accept': total_loss / group_count}
+
+    def loss_point_reliability(self, outputs, targets, indices, num_boxes, **kwargs):
+        """Detached matched-query reliability calibration for usable points.
+
+        This does not introduce a new coordinate objective.  The target is
+        derived from the already decoded, detached point error on Hungarian
+        matched instances: visible GT with L2 <= tau is reliable, visible GT
+        above tau is unreliable, and invisible GT contributes a low-weight
+        negative sample.
+        """
+        required = ('pred_point_reliability', 'pred_picking_offsets', 'pred_boxes')
+        if any(key not in outputs for key in required):
+            return {}
+
+        idx = self._get_src_permutation_idx(indices)
+        src_logits = outputs['pred_point_reliability'][idx].squeeze(-1)
+        if src_logits.numel() == 0:
+            return {'loss_point_reliability': outputs['pred_point_reliability'].sum() * 0.0}
+
+        src_offsets = outputs['pred_picking_offsets'][idx].detach()
+        src_boxes = outputs['pred_boxes'][idx].detach()
+        target_has = torch.cat(
+            [t['has_picking'][j] for t, (_, j) in zip(targets, indices)],
+            dim=0,
+        ).to(dtype=src_logits.dtype, device=src_logits.device)
+        target_offsets = torch.cat(
+            [t['picking_offsets'][j] for t, (_, j) in zip(targets, indices)],
+            dim=0,
+        ).to(dtype=src_offsets.dtype, device=src_offsets.device)
+        target_boxes = torch.cat(
+            [t['boxes'][j] for t, (_, j) in zip(targets, indices)],
+            dim=0,
+        ).to(dtype=src_boxes.dtype, device=src_boxes.device)
+        target_sizes = torch.cat(
+            [
+                t['orig_size'].to(device=src_boxes.device, dtype=src_boxes.dtype).view(1, 2).repeat(len(j), 1)
+                for t, (_, j) in zip(targets, indices)
+            ],
+            dim=0,
+        )
+
+        reliability_target = src_logits.new_zeros(src_logits.shape)
+        sample_weight = src_logits.new_full(src_logits.shape, self.point_reliability_invisible_weight)
+        visible = target_has > 0.5
+        if visible.any():
+            scale_xyxy = target_sizes[visible].repeat(1, 2)
+            pred_points = absolute_points_from_boxes_and_offsets(
+                src_boxes[visible] * scale_xyxy,
+                src_offsets[visible],
+                mode=self.point_reliability_offset_mode,
+                top_anchor_ratio=self.point_reliability_top_anchor_ratio,
+            )
+            target_points = absolute_points_from_boxes_and_offsets(
+                target_boxes[visible] * scale_xyxy,
+                target_offsets[visible],
+                mode=self.point_reliability_offset_mode,
+                top_anchor_ratio=self.point_reliability_top_anchor_ratio,
+            )
+            l2_pixel = torch.linalg.norm(pred_points - target_points, ord=2, dim=-1).detach()
+            if self.point_reliability_target == 'continuous_exp':
+                reliability_target[visible] = torch.exp(-l2_pixel / self.point_reliability_tau).to(
+                    dtype=reliability_target.dtype
+                )
+            else:
+                reliability_target[visible] = (l2_pixel <= self.point_reliability_tau).to(
+                    dtype=reliability_target.dtype
+                )
+            sample_weight[visible] = 1.0
+
+        loss = F.binary_cross_entropy_with_logits(
+            src_logits,
+            reliability_target.detach(),
+            weight=sample_weight.detach(),
+            reduction='sum',
+        ) / sample_weight.sum().clamp(min=1.0)
+        return {'loss_point_reliability': loss}
 
     def loss_weak_heatmap_score(self, outputs, targets, indices, num_boxes, **kwargs):
         """Weak Gaussian confidence for visible matched picking points.
@@ -1244,13 +1536,17 @@ class RTv4Criterion(nn.Module):
             'local': self.loss_local,
             'has_picking': self.loss_has_picking,
             'picking_offset': self.loss_picking_offset,
+            'grouped_picking_offset': self.loss_grouped_picking_offset,
+            'point_lsd': self.loss_point_lsd,
             'picking_locality': self.loss_picking_locality,
             'point_quality': self.loss_point_quality,
             'point_selector': self.loss_point_selector,
             'point_accept': self.loss_point_accept,
+            'point_reliability': self.loss_point_reliability,
             'weak_heatmap_score': self.loss_weak_heatmap_score,
             'toproi_simcc': self.loss_toproi_simcc,
             'toproi_heatmap': self.loss_toproi_heatmap,
+            'has_logit_distill': self.loss_has_logit_distill,
             'distill': self.loss_distillation,  # NEW: Add distillation loss
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
@@ -1266,6 +1562,8 @@ class RTv4Criterion(nn.Module):
         outputs_without_aux = {k: v for k, v in outputs.items() if 'aux' not in k}
 
         # Retrieve the matching between the outputs of the last layer and the targets
+        if hasattr(self.matcher, 'set_epoch'):
+            self.matcher.set_epoch(kwargs.get('epoch', None))
         indices = self.matcher(outputs_without_aux, targets)['indices']
         self._clear_cache()
 
@@ -1276,11 +1574,11 @@ class RTv4Criterion(nn.Module):
             if 'pre_outputs' in outputs:
                 aux_outputs_list = outputs['aux_outputs'] + [outputs['pre_outputs']]
             for i, aux_outputs in enumerate(aux_outputs_list):
-                indices_aux = self.matcher(aux_outputs, targets)['indices']
+                indices_aux = self.matcher(aux_outputs, targets, allow_point_cost=False)['indices']
                 cached_indices.append(indices_aux)
                 indices_aux_list.append(indices_aux)
             for i, aux_outputs in enumerate(outputs['enc_aux_outputs']):
-                indices_enc = self.matcher(aux_outputs, targets)['indices']
+                indices_enc = self.matcher(aux_outputs, targets, allow_point_cost=False)['indices']
                 cached_indices_enc.append(indices_enc)
                 indices_aux_list.append(indices_enc)
             indices_go = self._get_go_indices(indices, indices_aux_list)
@@ -1303,7 +1601,7 @@ class RTv4Criterion(nn.Module):
 
         # Compute all the requested losses, main loss
         losses = {}
-        main_only_losses = {'picking_locality', 'point_selector', 'point_accept', 'toproi_heatmap'}
+        main_only_losses = {'point_lsd', 'picking_locality', 'point_selector', 'point_accept', 'point_reliability', 'toproi_heatmap', 'has_logit_distill'}
         for loss_name in self.losses:
             # TODO, indices and num_box are different from RT-DETRv2
             if loss_name == 'distill':
@@ -1317,7 +1615,7 @@ class RTv4Criterion(nn.Module):
                 indices_in = indices_go if use_uni_set else indices
                 num_boxes_in = num_boxes_go if use_uni_set else num_boxes
                 meta = self.get_loss_meta_info(loss_name, outputs, targets, indices_in)
-                l_dict = self.get_loss(loss_name, outputs, targets, indices_in, num_boxes_in, **meta)
+                l_dict = self.get_loss(loss_name, outputs, targets, indices_in, num_boxes_in, **meta, **kwargs)
                 l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                 losses.update(l_dict)
 

@@ -462,6 +462,10 @@ class DFINETransformer(nn.Module):
                  use_point_accept_head=False,
                  point_accept_head_layers=2,
                  point_accept_detach_input=True,
+                 use_point_reliability_head=False,
+                 point_reliability_head_layers=2,
+                 point_reliability_detach_input=True,
+                 point_reliability_use_geometry=False,
                  use_weak_point_heatmap_head=False,
                  weak_heatmap_head_layers=2,
                  weak_heatmap_detach_input=True,
@@ -500,6 +504,11 @@ class DFINETransformer(nn.Module):
                  toproi_heatmap_size=12,
                  toproi_heatmap_detach_input=True,
                  toproi_heatmap_hidden_scale=0.50,
+                 use_grouped_picking_query=False,
+                 grouped_picking_query_hidden_scale=1.0,
+                 grouped_picking_use_toproi=True,
+                 grouped_picking_use_box_geometry=True,
+                 grouped_picking_residual_offset=False,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -532,6 +541,10 @@ class DFINETransformer(nn.Module):
         self.use_point_accept_head = bool(use_point_accept_head)
         self.point_accept_head_layers = max(int(point_accept_head_layers), 1)
         self.point_accept_detach_input = bool(point_accept_detach_input)
+        self.use_point_reliability_head = bool(use_point_reliability_head)
+        self.point_reliability_head_layers = max(int(point_reliability_head_layers), 1)
+        self.point_reliability_detach_input = bool(point_reliability_detach_input)
+        self.point_reliability_use_geometry = bool(point_reliability_use_geometry)
         self.use_weak_point_heatmap_head = bool(use_weak_point_heatmap_head)
         self.weak_heatmap_head_layers = max(int(weak_heatmap_head_layers), 1)
         self.weak_heatmap_detach_input = bool(weak_heatmap_detach_input)
@@ -588,6 +601,11 @@ class DFINETransformer(nn.Module):
         self.toproi_heatmap_size = max(int(toproi_heatmap_size), 2)
         self.toproi_heatmap_detach_input = bool(toproi_heatmap_detach_input)
         self.toproi_heatmap_hidden_scale = max(float(toproi_heatmap_hidden_scale), 0.125)
+        self.use_grouped_picking_query = bool(use_grouped_picking_query)
+        self.grouped_picking_query_hidden_scale = max(float(grouped_picking_query_hidden_scale), 0.125)
+        self.grouped_picking_use_toproi = bool(grouped_picking_use_toproi)
+        self.grouped_picking_use_box_geometry = bool(grouped_picking_use_box_geometry)
+        self.grouped_picking_residual_offset = bool(grouped_picking_residual_offset)
         # GPPoint-DETR keeps the detector queries intact and changes only how
         # the per-query point feature is enriched before has/offset prediction.
         self.point_legacy_local_feature = self.point_instance_binding_mode == 'legacy' and self.point_local_feature_fusion
@@ -652,6 +670,7 @@ class DFINETransformer(nn.Module):
         self.dec_point_quality_head = None
         self.dec_point_selector_head = None
         self.dec_point_accept_head = None
+        self.dec_point_reliability_head = None
         self.dec_weak_heatmap_head = None
         self.dec_toproi_simcc_x_head = None
         self.dec_toproi_simcc_y_head = None
@@ -661,10 +680,19 @@ class DFINETransformer(nn.Module):
         self.pre_point_quality_head = None
         self.pre_point_selector_head = None
         self.pre_point_accept_head = None
+        self.pre_point_reliability_head = None
         self.pre_weak_heatmap_head = None
         self.pre_toproi_simcc_x_head = None
         self.pre_toproi_simcc_y_head = None
         self.pre_toproi_heatmap_head = None
+        self.dec_grouped_query_pos_proj = None
+        self.dec_grouped_toproi_proj = None
+        self.dec_grouped_fusion_head = None
+        self.dec_grouped_offset_head = None
+        self.pre_grouped_query_pos_proj = None
+        self.pre_grouped_toproi_proj = None
+        self.pre_grouped_fusion_head = None
+        self.pre_grouped_offset_head = None
         self.dec_point_local_proj = None
         self.pre_point_local_proj = None
         self.dec_point_full_local_proj = None
@@ -786,6 +814,30 @@ class DFINETransformer(nn.Module):
                     self.point_accept_head_layers,
                     mlp_act,
                 )
+            if self.use_point_reliability_head:
+                self.dec_point_reliability_head = nn.ModuleList(
+                    [
+                        self._make_point_head(hidden_dim, point_hidden_dim, 1, self.point_reliability_head_layers, mlp_act)
+                        for _ in range(self.eval_idx + 1)
+                    ]
+                  + [
+                        self._make_point_head(
+                            scaled_dim,
+                            point_hidden_dim_scaled,
+                            1,
+                            self.point_reliability_head_layers,
+                            mlp_act,
+                        )
+                        for _ in range(num_layers - self.eval_idx - 1)
+                    ]
+                )
+                self.pre_point_reliability_head = self._make_point_head(
+                    hidden_dim,
+                    point_hidden_dim,
+                    1,
+                    self.point_reliability_head_layers,
+                    mlp_act,
+                )
             if self.use_weak_point_heatmap_head:
                 self.dec_weak_heatmap_head = nn.ModuleList(
                     [
@@ -851,6 +903,61 @@ class DFINETransformer(nn.Module):
                     [self._make_heatmap_head(hidden_dim, heatmap_hidden_dim, mlp_act) for _ in range(num_layers)]
                 )
                 self.pre_toproi_heatmap_head = self._make_heatmap_head(hidden_dim, heatmap_hidden_dim, mlp_act)
+            if self.use_grouped_picking_query:
+                # K=1 grouped picking query: derive a keypoint-specific token
+                # from each grape query, then regress the picking offset from
+                # that token plus local TopROI and box geometry cues.  This is
+                # intentionally separate from the standard offset_feature path.
+                grouped_hidden_dim = max(int(round(hidden_dim * self.grouped_picking_query_hidden_scale)), 1)
+                grouped_hidden_dim_scaled = max(int(round(scaled_dim * self.grouped_picking_query_hidden_scale)), 1)
+                self.pre_grouped_query_pos_proj = nn.Linear(hidden_dim, hidden_dim)
+                self.dec_grouped_query_pos_proj = nn.ModuleList(
+                    [nn.Linear(hidden_dim, hidden_dim) for _ in range(self.eval_idx + 1)]
+                  + [nn.Linear(hidden_dim, scaled_dim) for _ in range(num_layers - self.eval_idx - 1)]
+                )
+                if self.grouped_picking_use_toproi:
+                    self.pre_grouped_toproi_proj = nn.Linear(hidden_dim, hidden_dim)
+                    self.dec_grouped_toproi_proj = nn.ModuleList(
+                        [nn.Linear(hidden_dim, hidden_dim) for _ in range(self.eval_idx + 1)]
+                      + [nn.Linear(hidden_dim, scaled_dim) for _ in range(num_layers - self.eval_idx - 1)]
+                    )
+                grouped_input_parts = 1 + int(self.grouped_picking_use_toproi)
+                grouped_input_dim = grouped_input_parts * hidden_dim + (4 if self.grouped_picking_use_box_geometry else 0)
+                grouped_input_dim_scaled = grouped_input_parts * scaled_dim + (4 if self.grouped_picking_use_box_geometry else 0)
+                self.pre_grouped_fusion_head = self._make_point_head(
+                    grouped_input_dim,
+                    grouped_hidden_dim,
+                    hidden_dim,
+                    2,
+                    mlp_act,
+                )
+                self.dec_grouped_fusion_head = nn.ModuleList(
+                    [
+                        self._make_point_head(grouped_input_dim, grouped_hidden_dim, hidden_dim, 2, mlp_act)
+                        for _ in range(self.eval_idx + 1)
+                    ]
+                  + [
+                        self._make_point_head(grouped_input_dim_scaled, grouped_hidden_dim_scaled, scaled_dim, 2, mlp_act)
+                        for _ in range(num_layers - self.eval_idx - 1)
+                    ]
+                )
+                self.pre_grouped_offset_head = self._make_point_head(
+                    hidden_dim,
+                    grouped_hidden_dim,
+                    2,
+                    self.picking_offset_head_layers,
+                    mlp_act,
+                )
+                self.dec_grouped_offset_head = nn.ModuleList(
+                    [
+                        self._make_point_head(hidden_dim, grouped_hidden_dim, 2, self.picking_offset_head_layers, mlp_act)
+                        for _ in range(self.eval_idx + 1)
+                    ]
+                  + [
+                        self._make_point_head(scaled_dim, grouped_hidden_dim_scaled, 2, self.picking_offset_head_layers, mlp_act)
+                        for _ in range(num_layers - self.eval_idx - 1)
+                    ]
+                )
             if self.point_legacy_local_feature:
                 self.pre_point_local_proj = nn.Linear(hidden_dim, hidden_dim)
                 self.dec_point_local_proj = nn.ModuleList(
@@ -969,6 +1076,10 @@ class DFINETransformer(nn.Module):
             self.dec_point_accept_head = nn.ModuleList(
                 [nn.Identity()] * (self.eval_idx) + [self.dec_point_accept_head[self.eval_idx]]
             )
+        if self.dec_point_reliability_head is not None:
+            self.dec_point_reliability_head = nn.ModuleList(
+                [nn.Identity()] * (self.eval_idx) + [self.dec_point_reliability_head[self.eval_idx]]
+            )
         if self.dec_weak_heatmap_head is not None:
             self.dec_weak_heatmap_head = nn.ModuleList(
                 [nn.Identity()] * (self.eval_idx) + [self.dec_weak_heatmap_head[self.eval_idx]]
@@ -984,6 +1095,25 @@ class DFINETransformer(nn.Module):
         if self.dec_toproi_heatmap_head is not None:
             self.dec_toproi_heatmap_head = nn.ModuleList(
                 [nn.Identity()] * (self.eval_idx) + [self.dec_toproi_heatmap_head[self.eval_idx]]
+            )
+        if self.dec_grouped_query_pos_proj is not None:
+            self.dec_grouped_query_pos_proj = nn.ModuleList(
+                [nn.Identity()] * (self.eval_idx) + [self.dec_grouped_query_pos_proj[self.eval_idx]]
+            )
+        if self.dec_grouped_toproi_proj is not None:
+            self.dec_grouped_toproi_proj = nn.ModuleList(
+                [nn.Identity()] * (self.eval_idx) + [self.dec_grouped_toproi_proj[self.eval_idx]]
+            )
+        if self.dec_grouped_fusion_head is not None:
+            self.dec_grouped_fusion_head = nn.ModuleList(
+                [nn.Identity()] * (self.eval_idx) + [self.dec_grouped_fusion_head[self.eval_idx]]
+            )
+        if self.dec_grouped_offset_head is not None:
+            self.dec_grouped_offset_head = nn.ModuleList(
+                [
+                    self.dec_grouped_offset_head[i] if i <= self.eval_idx else nn.Identity()
+                    for i in range(len(self.dec_grouped_offset_head))
+                ]
             )
 
     @staticmethod
@@ -1275,6 +1405,7 @@ class DFINETransformer(nn.Module):
         quality_head,
         selector_head,
         accept_head,
+        reliability_head,
         weak_heatmap_head,
         simcc_x_head,
         simcc_y_head,
@@ -1367,6 +1498,14 @@ class DFINETransformer(nn.Module):
             accept_logits = accept_head(torch.cat((accept_base, accept_context, accept_geom), dim=-1))
         else:
             accept_logits = None
+        if reliability_head is not None:
+            # Reliability is a calibration-only head.  By default it sees the
+            # already learned point feature but cannot push gradients back into
+            # detector, visible-classification, or offset regression branches.
+            reliability_feature = offset_feature.detach() if self.point_reliability_detach_input else offset_feature
+            reliability_logits = reliability_head(reliability_feature)
+        else:
+            reliability_logits = None
         if weak_heatmap_head is not None:
             # Query-level weak Gaussian score is supervised from existing bbox +
             # visible 2D point labels.  Detach by default so it calibrates point
@@ -1399,11 +1538,58 @@ class DFINETransformer(nn.Module):
             quality_logits,
             selector_logits,
             accept_logits,
+            reliability_logits,
             weak_heatmap_logits,
             simcc_x_logits,
             simcc_y_logits,
             heatmap_logits,
         )
+
+    def _predict_grouped_picking_offsets(
+        self,
+        hidden: torch.Tensor,
+        boxes_cxcywh: torch.Tensor,
+        proj_feats: List[torch.Tensor],
+        query_pos_proj_head,
+        toproi_proj_head,
+        fusion_head,
+        offset_head,
+        base_offsets: torch.Tensor = None,
+        roi_boxes_cxcywh: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if (
+            not self.use_grouped_picking_query
+            or hidden is None
+            or boxes_cxcywh is None
+            or query_pos_proj_head is None
+            or fusion_head is None
+            or offset_head is None
+        ):
+            return None
+
+        query_pos = self.query_pos_head(boxes_cxcywh).to(dtype=hidden.dtype)
+        picking_query = hidden + query_pos_proj_head(query_pos)
+        parts = [picking_query]
+        local_boxes_cxcywh = boxes_cxcywh if roi_boxes_cxcywh is None else roi_boxes_cxcywh
+        if self.grouped_picking_use_toproi and toproi_proj_head is not None:
+            local_feat = self._pool_point_local_features(
+                proj_feats,
+                local_boxes_cxcywh,
+                roi_type='top',
+                top_roi_params=(
+                    self.point_offset_top_local_width_scale,
+                    self.point_offset_top_local_y_min_ratio,
+                    self.point_offset_top_local_y_max_ratio,
+                ) if self.point_decoupled_roi else None,
+            )
+            parts.append(toproi_proj_head(local_feat).to(dtype=hidden.dtype))
+        if self.grouped_picking_use_box_geometry:
+            parts.append(self._box_geometry_features(boxes_cxcywh).to(dtype=hidden.dtype))
+        grouped_feature = fusion_head(torch.cat(parts, dim=-1))
+        grouped_offsets = self._activate_point_offsets(offset_head(grouped_feature))
+        if self.grouped_picking_residual_offset and base_offsets is not None:
+            grouped_offsets = base_offsets.detach() + grouped_offsets
+        return grouped_offsets
 
     def _get_dn_teacher_roi_boxes(self, denoising_bbox_unact: torch.Tensor, dn_meta: dict) -> torch.Tensor:
         if (
@@ -1437,6 +1623,8 @@ class DFINETransformer(nn.Module):
             self._init_reg_head_zero(self.pre_point_selector_head)
         if self.pre_point_accept_head is not None:
             self._init_reg_head_zero(self.pre_point_accept_head)
+        if self.pre_point_reliability_head is not None:
+            self._init_reg_head_zero(self.pre_point_reliability_head)
         if self.pre_weak_heatmap_head is not None:
             self._init_reg_head_zero(self.pre_weak_heatmap_head)
         if self.pre_toproi_simcc_x_head is not None:
@@ -1445,6 +1633,10 @@ class DFINETransformer(nn.Module):
             self._init_reg_head_zero(self.pre_toproi_simcc_y_head)
         if self.pre_point_fusion_head is not None:
             self._init_reg_head_zero(self.pre_point_fusion_head)
+        if self.pre_grouped_fusion_head is not None:
+            self._init_reg_head_zero(self.pre_grouped_fusion_head)
+        if self.pre_grouped_offset_head is not None:
+            self._init_reg_head_zero(self.pre_grouped_offset_head)
 
         for cls_, reg_ in zip(self.dec_score_head, self.dec_bbox_head):
             init.constant_(cls_.bias, bias)
@@ -1466,6 +1658,9 @@ class DFINETransformer(nn.Module):
         if self.dec_point_accept_head is not None:
             for head in self.dec_point_accept_head:
                 self._init_reg_head_zero(head)
+        if self.dec_point_reliability_head is not None:
+            for head in self.dec_point_reliability_head:
+                self._init_reg_head_zero(head)
         if self.dec_weak_heatmap_head is not None:
             for head in self.dec_weak_heatmap_head:
                 self._init_reg_head_zero(head)
@@ -1477,6 +1672,12 @@ class DFINETransformer(nn.Module):
                 self._init_reg_head_zero(head)
         if self.dec_point_fusion_head is not None:
             for head in self.dec_point_fusion_head:
+                self._init_reg_head_zero(head)
+        if self.dec_grouped_fusion_head is not None:
+            for head in self.dec_grouped_fusion_head:
+                self._init_reg_head_zero(head)
+        if self.dec_grouped_offset_head is not None:
+            for head in self.dec_grouped_offset_head:
                 self._init_reg_head_zero(head)
         init.xavier_uniform_(self.enc_output[0].weight)
         if self.learn_query_content:
@@ -1706,7 +1907,7 @@ class DFINETransformer(nn.Module):
             dn_out_hidden = None
 
         if self.use_picking_point_head:
-            pre_picking_logits, pre_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits = self._predict_point_branch(
+            pre_picking_logits, pre_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_point_reliability_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits = self._predict_point_branch(
                 pre_hidden,
                 pre_bboxes,
                 pre_logits,
@@ -1716,6 +1917,7 @@ class DFINETransformer(nn.Module):
                 self.pre_point_quality_head,
                 self.pre_point_selector_head,
                 self.pre_point_accept_head,
+                self.pre_point_reliability_head,
                 self.pre_weak_heatmap_head,
                 self.pre_toproi_simcc_x_head,
                 self.pre_toproi_simcc_y_head,
@@ -1728,12 +1930,24 @@ class DFINETransformer(nn.Module):
                 self.pre_point_box_geom_proj,
                 self.pre_point_fusion_head,
             )
+            pre_grouped_picking_offsets = self._predict_grouped_picking_offsets(
+                pre_hidden,
+                pre_bboxes,
+                proj_feats,
+                self.pre_grouped_query_pos_proj,
+                self.pre_grouped_toproi_proj,
+                self.pre_grouped_fusion_head,
+                self.pre_grouped_offset_head,
+                pre_picking_offsets,
+            )
 
             out_picking_logits_list = []
             out_picking_offsets_list = []
+            out_grouped_picking_offsets_list = []
             out_point_quality_logits_list = []
             out_point_selector_logits_list = []
             out_point_accept_logits_list = []
+            out_point_reliability_logits_list = []
             out_weak_heatmap_logits_list = []
             out_toproi_simcc_x_logits_list = []
             out_toproi_simcc_y_logits_list = []
@@ -1743,7 +1957,7 @@ class DFINETransformer(nn.Module):
                 heatmap_head_i = None
                 if self.dec_toproi_heatmap_head is not None and layer_idx == final_decoder_layer_idx:
                     heatmap_head_i = self.dec_toproi_heatmap_head[layer_idx]
-                logits_i, offsets_i, quality_i, selector_i, accept_i, weak_heatmap_i, simcc_x_i, simcc_y_i, heatmap_i = self._predict_point_branch(
+                logits_i, offsets_i, quality_i, selector_i, accept_i, reliability_i, weak_heatmap_i, simcc_x_i, simcc_y_i, heatmap_i = self._predict_point_branch(
                     out_hidden[layer_idx],
                     out_bboxes[layer_idx],
                     out_logits[layer_idx],
@@ -1753,6 +1967,7 @@ class DFINETransformer(nn.Module):
                     self.dec_point_quality_head[layer_idx] if self.dec_point_quality_head is not None else None,
                     self.dec_point_selector_head[layer_idx] if self.dec_point_selector_head is not None else None,
                     self.dec_point_accept_head[layer_idx] if self.dec_point_accept_head is not None else None,
+                    self.dec_point_reliability_head[layer_idx] if self.dec_point_reliability_head is not None else None,
                     self.dec_weak_heatmap_head[layer_idx] if self.dec_weak_heatmap_head is not None else None,
                     self.dec_toproi_simcc_x_head[layer_idx] if self.dec_toproi_simcc_x_head is not None else None,
                     self.dec_toproi_simcc_y_head[layer_idx] if self.dec_toproi_simcc_y_head is not None else None,
@@ -1765,14 +1980,28 @@ class DFINETransformer(nn.Module):
                     self.dec_point_box_geom_proj[layer_idx] if self.dec_point_box_geom_proj is not None else None,
                     self.dec_point_fusion_head[layer_idx] if self.dec_point_fusion_head is not None else None,
                 )
+                grouped_offsets_i = self._predict_grouped_picking_offsets(
+                    out_hidden[layer_idx],
+                    out_bboxes[layer_idx],
+                    proj_feats,
+                    self.dec_grouped_query_pos_proj[layer_idx] if self.dec_grouped_query_pos_proj is not None else None,
+                    self.dec_grouped_toproi_proj[layer_idx] if self.dec_grouped_toproi_proj is not None else None,
+                    self.dec_grouped_fusion_head[layer_idx] if self.dec_grouped_fusion_head is not None else None,
+                    self.dec_grouped_offset_head[layer_idx] if self.dec_grouped_offset_head is not None else None,
+                    offsets_i,
+                )
                 out_picking_logits_list.append(logits_i)
                 out_picking_offsets_list.append(offsets_i)
+                if grouped_offsets_i is not None:
+                    out_grouped_picking_offsets_list.append(grouped_offsets_i)
                 if quality_i is not None:
                     out_point_quality_logits_list.append(quality_i)
                 if selector_i is not None:
                     out_point_selector_logits_list.append(selector_i)
                 if accept_i is not None:
                     out_point_accept_logits_list.append(accept_i)
+                if reliability_i is not None:
+                    out_point_reliability_logits_list.append(reliability_i)
                 if weak_heatmap_i is not None:
                     out_weak_heatmap_logits_list.append(weak_heatmap_i)
                 if simcc_x_i is not None:
@@ -1783,9 +2012,11 @@ class DFINETransformer(nn.Module):
                     out_toproi_heatmap_logits_list.append(heatmap_i)
             out_picking_logits = torch.stack(out_picking_logits_list) if out_picking_logits_list else None
             out_picking_offsets = torch.stack(out_picking_offsets_list) if out_picking_offsets_list else None
+            out_grouped_picking_offsets = torch.stack(out_grouped_picking_offsets_list) if out_grouped_picking_offsets_list else None
             out_point_quality_logits = torch.stack(out_point_quality_logits_list) if out_point_quality_logits_list else None
             out_point_selector_logits = torch.stack(out_point_selector_logits_list) if out_point_selector_logits_list else None
             out_point_accept_logits = torch.stack(out_point_accept_logits_list) if out_point_accept_logits_list else None
+            out_point_reliability_logits = torch.stack(out_point_reliability_logits_list) if out_point_reliability_logits_list else None
             out_weak_heatmap_logits = torch.stack(out_weak_heatmap_logits_list) if out_weak_heatmap_logits_list else None
             out_toproi_simcc_x_logits = torch.stack(out_toproi_simcc_x_logits_list) if out_toproi_simcc_x_logits_list else None
             out_toproi_simcc_y_logits = torch.stack(out_toproi_simcc_y_logits_list) if out_toproi_simcc_y_logits_list else None
@@ -1794,15 +2025,17 @@ class DFINETransformer(nn.Module):
             if dn_out_hidden is not None:
                 dn_out_picking_logits_list = []
                 dn_out_picking_offsets_list = []
+                dn_out_grouped_picking_offsets_list = []
                 dn_out_point_quality_logits_list = []
                 dn_out_point_selector_logits_list = []
                 dn_out_point_accept_logits_list = []
+                dn_out_point_reliability_logits_list = []
                 dn_out_weak_heatmap_logits_list = []
                 dn_out_toproi_simcc_x_logits_list = []
                 dn_out_toproi_simcc_y_logits_list = []
                 dn_out_toproi_heatmap_logits_list = []
                 for layer_idx in range(dn_out_hidden.shape[0]):
-                    logits_i, offsets_i, quality_i, selector_i, accept_i, weak_heatmap_i, simcc_x_i, simcc_y_i, heatmap_i = self._predict_point_branch(
+                    logits_i, offsets_i, quality_i, selector_i, accept_i, reliability_i, weak_heatmap_i, simcc_x_i, simcc_y_i, heatmap_i = self._predict_point_branch(
                         dn_out_hidden[layer_idx],
                         dn_out_bboxes[layer_idx],
                         dn_out_logits[layer_idx],
@@ -1812,6 +2045,7 @@ class DFINETransformer(nn.Module):
                         self.dec_point_quality_head[layer_idx] if self.dec_point_quality_head is not None else None,
                         self.dec_point_selector_head[layer_idx] if self.dec_point_selector_head is not None else None,
                         self.dec_point_accept_head[layer_idx] if self.dec_point_accept_head is not None else None,
+                        self.dec_point_reliability_head[layer_idx] if self.dec_point_reliability_head is not None else None,
                         self.dec_weak_heatmap_head[layer_idx] if self.dec_weak_heatmap_head is not None else None,
                         self.dec_toproi_simcc_x_head[layer_idx] if self.dec_toproi_simcc_x_head is not None else None,
                         self.dec_toproi_simcc_y_head[layer_idx] if self.dec_toproi_simcc_y_head is not None else None,
@@ -1825,14 +2059,29 @@ class DFINETransformer(nn.Module):
                         self.dec_point_fusion_head[layer_idx] if self.dec_point_fusion_head is not None else None,
                         roi_boxes_cxcywh=dn_teacher_roi_boxes,
                     )
+                    grouped_offsets_i = self._predict_grouped_picking_offsets(
+                        dn_out_hidden[layer_idx],
+                        dn_out_bboxes[layer_idx],
+                        proj_feats,
+                        self.dec_grouped_query_pos_proj[layer_idx] if self.dec_grouped_query_pos_proj is not None else None,
+                        self.dec_grouped_toproi_proj[layer_idx] if self.dec_grouped_toproi_proj is not None else None,
+                        self.dec_grouped_fusion_head[layer_idx] if self.dec_grouped_fusion_head is not None else None,
+                        self.dec_grouped_offset_head[layer_idx] if self.dec_grouped_offset_head is not None else None,
+                        offsets_i,
+                        roi_boxes_cxcywh=dn_teacher_roi_boxes,
+                    )
                     dn_out_picking_logits_list.append(logits_i)
                     dn_out_picking_offsets_list.append(offsets_i)
+                    if grouped_offsets_i is not None:
+                        dn_out_grouped_picking_offsets_list.append(grouped_offsets_i)
                     if quality_i is not None:
                         dn_out_point_quality_logits_list.append(quality_i)
                     if selector_i is not None:
                         dn_out_point_selector_logits_list.append(selector_i)
                     if accept_i is not None:
                         dn_out_point_accept_logits_list.append(accept_i)
+                    if reliability_i is not None:
+                        dn_out_point_reliability_logits_list.append(reliability_i)
                     if weak_heatmap_i is not None:
                         dn_out_weak_heatmap_logits_list.append(weak_heatmap_i)
                     if simcc_x_i is not None:
@@ -1843,18 +2092,20 @@ class DFINETransformer(nn.Module):
                         dn_out_toproi_heatmap_logits_list.append(heatmap_i)
                 dn_out_picking_logits = torch.stack(dn_out_picking_logits_list) if dn_out_picking_logits_list else None
                 dn_out_picking_offsets = torch.stack(dn_out_picking_offsets_list) if dn_out_picking_offsets_list else None
+                dn_out_grouped_picking_offsets = torch.stack(dn_out_grouped_picking_offsets_list) if dn_out_grouped_picking_offsets_list else None
                 dn_out_point_quality_logits = torch.stack(dn_out_point_quality_logits_list) if dn_out_point_quality_logits_list else None
                 dn_out_point_selector_logits = torch.stack(dn_out_point_selector_logits_list) if dn_out_point_selector_logits_list else None
                 dn_out_point_accept_logits = torch.stack(dn_out_point_accept_logits_list) if dn_out_point_accept_logits_list else None
+                dn_out_point_reliability_logits = torch.stack(dn_out_point_reliability_logits_list) if dn_out_point_reliability_logits_list else None
                 dn_out_weak_heatmap_logits = torch.stack(dn_out_weak_heatmap_logits_list) if dn_out_weak_heatmap_logits_list else None
                 dn_out_toproi_simcc_x_logits = torch.stack(dn_out_toproi_simcc_x_logits_list) if dn_out_toproi_simcc_x_logits_list else None
                 dn_out_toproi_simcc_y_logits = torch.stack(dn_out_toproi_simcc_y_logits_list) if dn_out_toproi_simcc_y_logits_list else None
                 dn_out_toproi_heatmap_logits = torch.stack(dn_out_toproi_heatmap_logits_list) if dn_out_toproi_heatmap_logits_list else None
             else:
-                dn_out_picking_logits, dn_out_picking_offsets, dn_out_point_quality_logits, dn_out_point_selector_logits, dn_out_point_accept_logits, dn_out_weak_heatmap_logits, dn_out_toproi_simcc_x_logits, dn_out_toproi_simcc_y_logits, dn_out_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None
+                dn_out_picking_logits, dn_out_picking_offsets, dn_out_grouped_picking_offsets, dn_out_point_quality_logits, dn_out_point_selector_logits, dn_out_point_accept_logits, dn_out_point_reliability_logits, dn_out_weak_heatmap_logits, dn_out_toproi_simcc_x_logits, dn_out_toproi_simcc_y_logits, dn_out_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
 
             if dn_pre_hidden is not None:
-                dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits = self._predict_point_branch(
+                dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_point_reliability_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits = self._predict_point_branch(
                     dn_pre_hidden,
                     dn_pre_bboxes,
                     dn_pre_logits,
@@ -1864,6 +2115,7 @@ class DFINETransformer(nn.Module):
                     self.pre_point_quality_head,
                     self.pre_point_selector_head,
                     self.pre_point_accept_head,
+                    self.pre_point_reliability_head,
                     self.pre_weak_heatmap_head,
                     self.pre_toproi_simcc_x_head,
                     self.pre_toproi_simcc_y_head,
@@ -1877,21 +2129,34 @@ class DFINETransformer(nn.Module):
                     self.pre_point_fusion_head,
                     roi_boxes_cxcywh=dn_teacher_roi_boxes,
                 )
+                dn_pre_grouped_picking_offsets = self._predict_grouped_picking_offsets(
+                    dn_pre_hidden,
+                    dn_pre_bboxes,
+                    proj_feats,
+                    self.pre_grouped_query_pos_proj,
+                    self.pre_grouped_toproi_proj,
+                    self.pre_grouped_fusion_head,
+                    self.pre_grouped_offset_head,
+                    dn_pre_picking_offsets,
+                    roi_boxes_cxcywh=dn_teacher_roi_boxes,
+                )
             else:
-                dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None
+                dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_grouped_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_point_reliability_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
         else:
             out_picking_logits = None
             out_picking_offsets = None
+            out_grouped_picking_offsets = None
             out_point_quality_logits = None
             out_point_selector_logits = None
             out_point_accept_logits = None
+            out_point_reliability_logits = None
             out_weak_heatmap_logits = None
             out_toproi_simcc_x_logits = None
             out_toproi_simcc_y_logits = None
             out_toproi_heatmap_logits = None
-            dn_out_picking_logits, dn_out_picking_offsets, dn_out_point_quality_logits, dn_out_point_selector_logits, dn_out_point_accept_logits, dn_out_weak_heatmap_logits, dn_out_toproi_simcc_x_logits, dn_out_toproi_simcc_y_logits, dn_out_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None
-            pre_picking_logits, pre_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None
-            dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None
+            dn_out_picking_logits, dn_out_picking_offsets, dn_out_grouped_picking_offsets, dn_out_point_quality_logits, dn_out_point_selector_logits, dn_out_point_accept_logits, dn_out_point_reliability_logits, dn_out_weak_heatmap_logits, dn_out_toproi_simcc_x_logits, dn_out_toproi_simcc_y_logits, dn_out_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
+            pre_picking_logits, pre_picking_offsets, pre_grouped_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_point_reliability_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
+            dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_grouped_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_point_reliability_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
 
 
         if self.training:
@@ -1903,12 +2168,16 @@ class DFINETransformer(nn.Module):
             # Final per-query outputs consumed by criterion and postprocessor.
             out['pred_has_picking'] = out_picking_logits[-1]
             out['pred_picking_offsets'] = out_picking_offsets[-1]
+            if out_grouped_picking_offsets is not None:
+                out['pred_grouped_picking_offsets'] = out_grouped_picking_offsets[-1]
             if out_point_quality_logits is not None:
                 out['pred_point_quality'] = out_point_quality_logits[-1]
             if out_point_selector_logits is not None:
                 out['pred_point_selector'] = out_point_selector_logits[-1]
             if out_point_accept_logits is not None:
                 out['pred_point_accept'] = out_point_accept_logits[-1]
+            if out_point_reliability_logits is not None:
+                out['pred_point_reliability'] = out_point_reliability_logits[-1]
             if out_weak_heatmap_logits is not None:
                 out['pred_weak_heatmap_score'] = out_weak_heatmap_logits[-1]
             if out_toproi_simcc_x_logits is not None and out_toproi_simcc_y_logits is not None:
@@ -1927,9 +2196,11 @@ class DFINETransformer(nn.Module):
                 out_logits[-1],
                 out_picking_logits[:-1] if out_picking_logits is not None else None,
                 out_picking_offsets[:-1] if out_picking_offsets is not None else None,
+                out_grouped_picking_offsets[:-1] if out_grouped_picking_offsets is not None else None,
                 out_point_quality_logits[:-1] if out_point_quality_logits is not None else None,
                 out_point_selector_logits[:-1] if out_point_selector_logits is not None else None,
                 out_point_accept_logits[:-1] if out_point_accept_logits is not None else None,
+                out_point_reliability_logits[:-1] if out_point_reliability_logits is not None else None,
                 out_weak_heatmap_logits[:-1] if out_weak_heatmap_logits is not None else None,
                 out_toproi_simcc_x_logits[:-1] if out_toproi_simcc_x_logits is not None else None,
                 out_toproi_simcc_y_logits[:-1] if out_toproi_simcc_y_logits is not None else None,
@@ -1940,12 +2211,16 @@ class DFINETransformer(nn.Module):
             if pre_picking_logits is not None:
                 out['pre_outputs']['pred_has_picking'] = pre_picking_logits
                 out['pre_outputs']['pred_picking_offsets'] = pre_picking_offsets
+                if pre_grouped_picking_offsets is not None:
+                    out['pre_outputs']['pred_grouped_picking_offsets'] = pre_grouped_picking_offsets
                 if pre_point_quality_logits is not None:
                     out['pre_outputs']['pred_point_quality'] = pre_point_quality_logits
                 if pre_point_selector_logits is not None:
                     out['pre_outputs']['pred_point_selector'] = pre_point_selector_logits
                 if pre_point_accept_logits is not None:
                     out['pre_outputs']['pred_point_accept'] = pre_point_accept_logits
+                if pre_point_reliability_logits is not None:
+                    out['pre_outputs']['pred_point_reliability'] = pre_point_reliability_logits
                 if pre_weak_heatmap_logits is not None:
                     out['pre_outputs']['pred_weak_heatmap_score'] = pre_weak_heatmap_logits
                 if pre_toproi_simcc_x_logits is not None and pre_toproi_simcc_y_logits is not None:
@@ -1965,9 +2240,11 @@ class DFINETransformer(nn.Module):
                     dn_out_logits[-1],
                     dn_out_picking_logits,
                     dn_out_picking_offsets,
+                    dn_out_grouped_picking_offsets,
                     dn_out_point_quality_logits,
                     dn_out_point_selector_logits,
                     dn_out_point_accept_logits,
+                    dn_out_point_reliability_logits,
                     dn_out_weak_heatmap_logits,
                     dn_out_toproi_simcc_x_logits,
                     dn_out_toproi_simcc_y_logits,
@@ -1977,12 +2254,16 @@ class DFINETransformer(nn.Module):
                 if dn_pre_picking_logits is not None:
                     out['dn_pre_outputs']['pred_has_picking'] = dn_pre_picking_logits
                     out['dn_pre_outputs']['pred_picking_offsets'] = dn_pre_picking_offsets
+                    if dn_pre_grouped_picking_offsets is not None:
+                        out['dn_pre_outputs']['pred_grouped_picking_offsets'] = dn_pre_grouped_picking_offsets
                     if dn_pre_point_quality_logits is not None:
                         out['dn_pre_outputs']['pred_point_quality'] = dn_pre_point_quality_logits
                     if dn_pre_point_selector_logits is not None:
                         out['dn_pre_outputs']['pred_point_selector'] = dn_pre_point_selector_logits
                     if dn_pre_point_accept_logits is not None:
                         out['dn_pre_outputs']['pred_point_accept'] = dn_pre_point_accept_logits
+                    if dn_pre_point_reliability_logits is not None:
+                        out['dn_pre_outputs']['pred_point_reliability'] = dn_pre_point_reliability_logits
                     if dn_pre_weak_heatmap_logits is not None:
                         out['dn_pre_outputs']['pred_weak_heatmap_score'] = dn_pre_weak_heatmap_logits
                     if dn_pre_toproi_simcc_x_logits is not None and dn_pre_toproi_simcc_y_logits is not None:
@@ -2002,9 +2283,11 @@ class DFINETransformer(nn.Module):
         outputs_coord,
         outputs_picking_logits=None,
         outputs_picking_offsets=None,
+        outputs_grouped_picking_offsets=None,
         outputs_point_quality_logits=None,
         outputs_point_selector_logits=None,
         outputs_point_accept_logits=None,
+        outputs_point_reliability_logits=None,
         outputs_weak_heatmap_logits=None,
         outputs_toproi_simcc_x_logits=None,
         outputs_toproi_simcc_y_logits=None,
@@ -2020,12 +2303,16 @@ class DFINETransformer(nn.Module):
                 item['pred_has_picking'] = outputs_picking_logits[idx]
             if outputs_picking_offsets is not None:
                 item['pred_picking_offsets'] = outputs_picking_offsets[idx]
+            if outputs_grouped_picking_offsets is not None:
+                item['pred_grouped_picking_offsets'] = outputs_grouped_picking_offsets[idx]
             if outputs_point_quality_logits is not None:
                 item['pred_point_quality'] = outputs_point_quality_logits[idx]
             if outputs_point_selector_logits is not None:
                 item['pred_point_selector'] = outputs_point_selector_logits[idx]
             if outputs_point_accept_logits is not None:
                 item['pred_point_accept'] = outputs_point_accept_logits[idx]
+            if outputs_point_reliability_logits is not None:
+                item['pred_point_reliability'] = outputs_point_reliability_logits[idx]
             if outputs_weak_heatmap_logits is not None:
                 item['pred_weak_heatmap_score'] = outputs_weak_heatmap_logits[idx]
             if outputs_toproi_simcc_x_logits is not None and outputs_toproi_simcc_y_logits is not None:
@@ -2041,9 +2328,11 @@ class DFINETransformer(nn.Module):
     def _set_aux_loss2(self, outputs_class, outputs_coord, outputs_corners, outputs_ref,
                        teacher_corners=None, teacher_logits=None,
                        outputs_picking_logits=None, outputs_picking_offsets=None,
+                       outputs_grouped_picking_offsets=None,
                        outputs_point_quality_logits=None,
                        outputs_point_selector_logits=None,
                        outputs_point_accept_logits=None,
+                       outputs_point_reliability_logits=None,
                        outputs_weak_heatmap_logits=None,
                        outputs_toproi_simcc_x_logits=None,
                        outputs_toproi_simcc_y_logits=None,
@@ -2065,12 +2354,16 @@ class DFINETransformer(nn.Module):
                 item['pred_has_picking'] = outputs_picking_logits[idx]
             if outputs_picking_offsets is not None:
                 item['pred_picking_offsets'] = outputs_picking_offsets[idx]
+            if outputs_grouped_picking_offsets is not None:
+                item['pred_grouped_picking_offsets'] = outputs_grouped_picking_offsets[idx]
             if outputs_point_quality_logits is not None:
                 item['pred_point_quality'] = outputs_point_quality_logits[idx]
             if outputs_point_selector_logits is not None:
                 item['pred_point_selector'] = outputs_point_selector_logits[idx]
             if outputs_point_accept_logits is not None:
                 item['pred_point_accept'] = outputs_point_accept_logits[idx]
+            if outputs_point_reliability_logits is not None:
+                item['pred_point_reliability'] = outputs_point_reliability_logits[idx]
             if outputs_weak_heatmap_logits is not None:
                 item['pred_weak_heatmap_score'] = outputs_weak_heatmap_logits[idx]
             if outputs_toproi_simcc_x_logits is not None and outputs_toproi_simcc_y_logits is not None:

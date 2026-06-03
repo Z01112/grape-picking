@@ -16,7 +16,11 @@ from ultralytics import YOLO
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 DEFAULT_YOLO_ROOT = Path(r"D:\Projects\ultralytics-rtdetr")
+
+from tools.grape_point_eval_utils import collect_case_groups, compute_unified_point_metrics, xyxy_to_xywh
 
 
 @dataclass
@@ -257,78 +261,101 @@ def evaluate_point_metrics(
     pred_map: dict[str, list[Prediction]],
     args: argparse.Namespace,
 ) -> dict:
-    visible_gt_count = 0
-    gt_count = 0
-    pred_has_count = 0
-    false_positive = 0
-    errors: list[dict[str, float]] = []
-    case_rows: list[dict[str, Any]] = []
+    records: list[dict] = []
 
     for image_path in images:
         with Image.open(image_path) as im:
             width, height = im.size
         gt = load_gt(label_dir / f"{image_path.stem}.txt", width, height)
-        gt_count += len(gt)
-        visible_gt_count += sum(1 for item in gt if item.visible)
-        matched_gt: set[int] = set()
         preds = [
             p
             for p in pred_map.get(image_path.name, [])
-            if p.box_conf >= args.box_conf_threshold and p.kpt_conf >= args.kpt_conf_threshold
+            if p.box_conf >= args.box_conf_threshold
         ]
-        preds.sort(key=lambda p: p.box_conf * p.kpt_conf, reverse=True)
-        pred_has_count += len(preds)
-
-        for pred in preds:
-            best_idx = -1
-            best_iou = 0.0
-            for idx, target in enumerate(gt):
-                if idx in matched_gt:
-                    continue
-                iou = box_iou(pred.box_xyxy, target.box_xyxy)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_idx = idx
-            if best_idx < 0 or best_iou < args.match_iou:
-                false_positive += 1
-                continue
-            matched_gt.add(best_idx)
-            target = gt[best_idx]
-            if not target.visible:
-                false_positive += 1
-                continue
-            delta = pred.keypoint_xy - target.keypoint_xy
-            l2 = float(np.linalg.norm(delta))
-            row = {
-                "image": image_path.name,
-                "iou": float(best_iou),
-                "box_conf": float(pred.box_conf),
-                "kpt_conf": float(pred.kpt_conf),
-                "dx": float(delta[0]),
-                "dy": float(delta[1]),
-                "l2": l2,
+        records.append(
+            {
+                "image_id": len(records),
+                "file_name": image_path.name,
+                "image_path": str(image_path.resolve()),
+                "width": int(width),
+                "height": int(height),
+                "gt_instances": [
+                    {
+                        "bbox_xyxy": [float(v) for v in item.box_xyxy.tolist()],
+                        "bbox_xywh": xyxy_to_xywh([float(v) for v in item.box_xyxy.tolist()]),
+                        "area": float(max(0.0, item.box_xyxy[2] - item.box_xyxy[0]) * max(0.0, item.box_xyxy[3] - item.box_xyxy[1])),
+                        "has_picking": bool(item.visible),
+                        "picking_point": [float(v) for v in item.keypoint_xy.tolist()],
+                    }
+                    for item in gt
+                ],
+                "pred_instances": [
+                    {
+                        "bbox_xyxy": [float(v) for v in pred.box_xyxy.tolist()],
+                        "bbox_xywh": xyxy_to_xywh([float(v) for v in pred.box_xyxy.tolist()]),
+                        "score": float(pred.box_conf * pred.kpt_conf),
+                        "label": 0,
+                        "raw_has_picking_score": float(pred.kpt_conf),
+                        "has_picking_score": float(pred.kpt_conf),
+                        "visible_score": float(pred.kpt_conf),
+                        "picking_point": [float(v) for v in pred.keypoint_xy.tolist()],
+                        "source": "yolo_pose",
+                    }
+                    for pred in preds
+                ],
             }
-            errors.append(row)
-            case_rows.append(row)
+        )
 
-    true_positive = len(errors)
-    false_negative = max(visible_gt_count - true_positive, 0)
-    precision = true_positive / pred_has_count if pred_has_count else 0.0
-    recall = true_positive / visible_gt_count if visible_gt_count else 0.0
-    f1 = 2.0 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
-    point = summarize_errors(errors)
+    unified = compute_unified_point_metrics(
+        records,
+        iou_threshold=args.match_iou,
+        has_picking_threshold=args.kpt_conf_threshold,
+        visibility_score_key="visible_score",
+    )
+    instance = unified["instance_chain"]
+    point = {
+        "pair_count": int(instance["point_pair_count"]),
+        "mean_l2_px": float(instance["point_mean_l2_px"]),
+        "median_l2_px": float(instance["point_median_l2_px"]),
+        "p90_l2_px": float(instance["point_p90_l2_px"]),
+        "mean_abs_dx_px": float(instance["point_mae_x_px"]),
+        "mean_abs_dy_px": float(instance["point_mae_y_px"]),
+        "ppl_sr_30": float(instance["ppl_sr_30"]),
+        "ppl_sr_50": float(instance["ppl_sr_50"]),
+    }
+    case_rows = []
+    correct_pairs, _, _ = collect_case_groups(
+        records,
+        iou_threshold=args.match_iou,
+        has_picking_threshold=args.kpt_conf_threshold,
+        visibility_score_key="visible_score",
+    )
+    for case in correct_pairs:
+        case_rows.append(
+            {
+                "image": case.get("file_name", ""),
+                "iou": float(case.get("iou", 0.0)),
+                "box_conf": float(case.get("pred_score", 0.0)),
+                "kpt_conf": float(case.get("pred_visible_score", 0.0)),
+                "dx": float(case.get("dx_px", 0.0)),
+                "dy": float(case.get("dy_px", 0.0)),
+                "l2": float(case.get("l2_px", 0.0)),
+            }
+        )
     return {
-        "gt_count": int(gt_count),
-        "visible_gt_count": int(visible_gt_count),
-        "predicted_has_count": int(pred_has_count),
+        "gt_count": int(sum(len(record["gt_instances"]) for record in records)),
+        "visible_gt_count": int(instance["visible_gt_total"]),
+        "predicted_has_count": int(unified["global_chain"]["unmatched_or_unfiltered_predicted_visible_total"]),
         "has_picking": {
-            "precision": float(precision),
-            "recall": float(recall),
-            "f1": float(f1),
-            "false_positive": int(false_positive),
-            "false_negative": int(false_negative),
+            "precision": float(instance["has_picking_precision"]),
+            "recall": float(instance["has_picking_recall"]),
+            "f1": float(instance["has_picking_f1"]),
+            "false_positive": int(instance["has_picking_false_positive"]),
+            "false_negative": int(instance["has_picking_false_negative"]),
         },
         "picking_point": point,
+        "unified_point_metrics": unified,
+        "records": records,
         "cases": sorted(case_rows, key=lambda x: x["l2"], reverse=True)[:30],
     }
 
@@ -443,6 +470,7 @@ def main() -> int:
         },
         "yolo_native_metrics": val_metrics,
         "yolo_picking_metrics": point_metrics,
+        "unified_point_metrics": point_metrics.get("unified_point_metrics", {}),
         "comparison_rows": rows,
     }
     (args.output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -451,6 +479,7 @@ def main() -> int:
         "# YOLO-Pose Grape Picking-Point Baseline",
         "",
         "This report converts YOLO-Pose predictions into the same instance-bound visible picking-point protocol used by GPPoint-DETR.",
+        "Point metrics are computed by `tools/grape_point_eval_utils.py`, the same records matching path used by GPPoint-DETR reports.",
         "",
         f"- split: `{split}`",
         f"- images: `{len(images)}`",

@@ -328,6 +328,7 @@ class GrapePointEvaluator(CocoEvaluator):
         # grape boxes and GT grape boxes. They measure the instance-level chain:
         # grape matched -> visible point predicted -> point error accumulated.
         matched_grapes = sum(int(item["matched_grapes"]) for item in self.point_records)
+        visible_gt_total = sum(int(item.get("visible_gt_total", 0)) for item in self.point_records)
         matched_visible_grapes = sum(int(item["matched_visible_grapes"]) for item in self.point_records)
         predicted_visible = sum(int(item["predicted_visible"]) for item in self.point_records)
         correct_visible = sum(int(item["correct_visible"]) for item in self.point_records)
@@ -343,11 +344,22 @@ class GrapePointEvaluator(CocoEvaluator):
         precision = float(correct_visible / predicted_visible) if predicted_visible > 0 else 0.0
         recall = float(correct_visible / matched_visible_grapes) if matched_visible_grapes > 0 else 0.0
         f1 = 0.0 if precision + recall == 0 else float(2 * precision * recall / (precision + recall))
+        detection_visible_recall = (
+            float(matched_visible_grapes / visible_gt_total) if visible_gt_total > 0 else 0.0
+        )
+        global_visible_recall = float(correct_visible / visible_gt_total) if visible_gt_total > 0 else 0.0
 
         metrics = {
+            "visible_gt_total": visible_gt_total,
             "matched_grapes_iou50": matched_grapes,
             "matched_visible_grapes": matched_visible_grapes,
             "predicted_visible_grapes": predicted_visible,
+            "correct_visible_grapes": correct_visible,
+            "detection_visible_recall": detection_visible_recall,
+            "global_visible_recall": global_visible_recall,
+            "instance_visible_precision": precision,
+            "instance_visible_recall": recall,
+            "instance_visible_f1": f1,
             "has_picking_precision": precision,
             "has_picking_recall": recall,
             "has_picking_f1": f1,
@@ -383,8 +395,10 @@ class GrapePointEvaluator(CocoEvaluator):
 
     def _evaluate_points_for_image(self, image_id: int, prediction: dict):
         gt_entries = self.gt_points_by_image.get(image_id, [])
+        visible_gt_total = sum(1 for item in gt_entries if float(item.get("has_picking", 0.0)) > 0.5)
         if not gt_entries:
             return {
+                "visible_gt_total": 0,
                 "matched_grapes": 0,
                 "matched_visible_grapes": 0,
                 "predicted_visible": 0,
@@ -418,6 +432,7 @@ class GrapePointEvaluator(CocoEvaluator):
 
         if pred_boxes.numel() == 0 or gt_boxes.numel() == 0:
             return {
+                "visible_gt_total": visible_gt_total,
                 "matched_grapes": 0,
                 "matched_visible_grapes": 0,
                 "predicted_visible": 0,
@@ -484,6 +499,7 @@ class GrapePointEvaluator(CocoEvaluator):
                 false_visible += 1
 
         return {
+            "visible_gt_total": visible_gt_total,
             "matched_grapes": len(matched_pairs),
             "matched_visible_grapes": matched_visible_grapes,
             "predicted_visible": predicted_visible,

@@ -19,6 +19,20 @@ from ..optim import ModelEMA, Warmup
 from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
 
+def _set_frozen_norm_eval(module: torch.nn.Module) -> None:
+    norm_types = (
+        torch.nn.BatchNorm1d,
+        torch.nn.BatchNorm2d,
+        torch.nn.BatchNorm3d,
+        torch.nn.SyncBatchNorm,
+    )
+    for child in module.modules():
+        if isinstance(child, norm_types):
+            params = list(child.parameters(recurse=False))
+            if not params or all(not param.requires_grad for param in params):
+                child.eval()
+
+
 def _compute_encoder_transformer_grad_percentage(model: torch.nn.Module) -> float:
     """Compute percentage of gradients attributed to encoder transformer only.
     This avoids collecting/printing any other stats for speed.
@@ -43,6 +57,8 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, **kwargs):
     model.train()
+    if kwargs.get('freeze_frozen_norm_eval', False):
+        _set_frozen_norm_eval(model)
     criterion.train()
     metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -60,6 +76,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
     cur_iters = epoch * len(data_loader)
 
     teacher_model = kwargs.get('teacher_model', None)
+    has_logit_teacher_model = kwargs.get('has_logit_teacher_model', None)
 
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         samples = samples.to(device)
@@ -71,6 +88,10 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
         if teacher_model is not None:
             with torch.no_grad():
                 teacher_encoder_output_for_distillation = teacher_model(samples).detach()
+        teacher_outputs_for_has_logit_distill = None
+        if has_logit_teacher_model is not None:
+            with torch.no_grad():
+                teacher_outputs_for_has_logit_distill = has_logit_teacher_model(samples)
 
         if scaler is not None:
             with torch.autocast(device_type=str(device), cache_enabled=True):
@@ -88,7 +109,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                 dist_utils.save_on_master(new_state, "./NaN.pth")
 
             with torch.autocast(device_type=str(device), enabled=False):
-                loss_dict = criterion(outputs, targets, **metas)
+                loss_dict = criterion(outputs, targets, teacher_outputs=teacher_outputs_for_has_logit_distill, **metas)
 
             loss = sum(loss_dict.values())
             scaler.scale(loss).backward()
@@ -111,7 +132,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
         else:
             outputs = model(samples, targets=targets,
                             teacher_encoder_output=teacher_encoder_output_for_distillation) # NEW kwarg
-            loss_dict = criterion(outputs, targets, **metas)
+            loss_dict = criterion(outputs, targets, teacher_outputs=teacher_outputs_for_has_logit_distill, **metas)
 
             loss : torch.Tensor = sum(loss_dict.values())
             optimizer.zero_grad()

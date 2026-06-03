@@ -49,6 +49,7 @@ class PostProcessor(nn.Module):
         point_quality_score_alpha=1.0,
         point_selector_score_alpha=1.0,
         point_accept_score_alpha=1.0,
+        point_reliability_score_alpha=1.0,
         use_toproi_simcc_refiner=False,
         toproi_simcc_x_min=-0.60,
         toproi_simcc_x_max=0.60,
@@ -59,6 +60,7 @@ class PostProcessor(nn.Module):
         toproi_heatmap_x_max=0.60,
         toproi_heatmap_y_min=-0.35,
         toproi_heatmap_y_max=0.45,
+        use_grouped_picking_offsets=False,
     ) -> None:
         super().__init__()
         self.use_focal_loss = use_focal_loss
@@ -78,6 +80,7 @@ class PostProcessor(nn.Module):
         self.point_quality_score_alpha = float(point_quality_score_alpha)
         self.point_selector_score_alpha = float(point_selector_score_alpha)
         self.point_accept_score_alpha = float(point_accept_score_alpha)
+        self.point_reliability_score_alpha = float(point_reliability_score_alpha)
         self.use_toproi_simcc_refiner = bool(use_toproi_simcc_refiner)
         self.toproi_simcc_x_min = float(toproi_simcc_x_min)
         self.toproi_simcc_x_max = float(toproi_simcc_x_max)
@@ -88,6 +91,7 @@ class PostProcessor(nn.Module):
         self.toproi_heatmap_x_max = float(toproi_heatmap_x_max)
         self.toproi_heatmap_y_min = float(toproi_heatmap_y_min)
         self.toproi_heatmap_y_max = float(toproi_heatmap_y_max)
+        self.use_grouped_picking_offsets = bool(use_grouped_picking_offsets)
         if self.toproi_simcc_x_max <= self.toproi_simcc_x_min:
             self.toproi_simcc_x_max = self.toproi_simcc_x_min + 1.0
         if self.toproi_simcc_y_max <= self.toproi_simcc_y_min:
@@ -96,10 +100,10 @@ class PostProcessor(nn.Module):
             self.toproi_heatmap_x_max = self.toproi_heatmap_x_min + 1.0
         if self.toproi_heatmap_y_max <= self.toproi_heatmap_y_min:
             self.toproi_heatmap_y_max = self.toproi_heatmap_y_min + 1.0
-        if self.point_visibility_score_mode not in {"has", "quality", "selector", "accept"}:
+        if self.point_visibility_score_mode not in {"has", "quality", "selector", "accept", "reliability"}:
             raise ValueError(
                 f"Unsupported point_visibility_score_mode={point_visibility_score_mode!r}; "
-                "expected 'has', 'quality', 'selector', or 'accept'."
+                "expected 'has', 'quality', 'selector', 'accept', or 'reliability'."
             )
         self.deploy_mode = False
 
@@ -158,16 +162,21 @@ class PostProcessor(nn.Module):
         bbox_pred *= orig_target_sizes.repeat(1, 2).unsqueeze(1)
 
         selected_boxes_cxcywh = boxes_cxcywh
+        raw_has_picking_scores = None
         has_picking_scores = None
+        visible_scores = None
         has_picking_flags = None
         picking_points = None
         picking_offsets = None
+        grouped_picking_offsets = None
         point_quality_scores = None
         point_final_scores = None
         point_selector_scores = None
         point_selector_final_scores = None
         point_accept_scores = None
         point_accept_final_scores = None
+        point_reliability_scores = None
+        point_reliability_final_scores = None
         weak_heatmap_scores = None
 
         if self.use_focal_loss:
@@ -201,9 +210,11 @@ class PostProcessor(nn.Module):
         if self.use_picking_point and 'pred_has_picking' in outputs and 'pred_picking_offsets' in outputs:
             pred_has_picking = outputs['pred_has_picking']
             pred_offsets = outputs['pred_picking_offsets']
+            pred_grouped_offsets = outputs.get('pred_grouped_picking_offsets')
             pred_point_quality = outputs.get('pred_point_quality')
             pred_point_selector = outputs.get('pred_point_selector')
             pred_point_accept = outputs.get('pred_point_accept')
+            pred_point_reliability = outputs.get('pred_point_reliability')
             pred_weak_heatmap = outputs.get('pred_weak_heatmap_score')
             pred_simcc_x = outputs.get('pred_toproi_simcc_x')
             pred_simcc_y = outputs.get('pred_toproi_simcc_y')
@@ -220,6 +231,11 @@ class PostProcessor(nn.Module):
                     dim=1,
                     index=index.unsqueeze(-1).repeat(1, 1, pred_offsets.shape[-1]),
                 )
+                if pred_grouped_offsets is not None:
+                    pred_grouped_offsets = pred_grouped_offsets.gather(
+                        dim=1,
+                        index=index.unsqueeze(-1).repeat(1, 1, pred_grouped_offsets.shape[-1]),
+                    )
                 if pred_point_quality is not None:
                     pred_point_quality = pred_point_quality.gather(
                         dim=1,
@@ -234,6 +250,11 @@ class PostProcessor(nn.Module):
                     pred_point_accept = pred_point_accept.gather(
                         dim=1,
                         index=index.unsqueeze(-1).repeat(1, 1, pred_point_accept.shape[-1]),
+                    )
+                if pred_point_reliability is not None:
+                    pred_point_reliability = pred_point_reliability.gather(
+                        dim=1,
+                        index=index.unsqueeze(-1).repeat(1, 1, pred_point_reliability.shape[-1]),
                     )
                 if pred_weak_heatmap is not None:
                     pred_weak_heatmap = pred_weak_heatmap.gather(
@@ -258,7 +279,10 @@ class PostProcessor(nn.Module):
                         ),
                     )
 
-            if self.use_toproi_simcc_refiner and pred_simcc_x is not None and pred_simcc_y is not None:
+            if self.use_grouped_picking_offsets and pred_grouped_offsets is not None:
+                grouped_picking_offsets = pred_grouped_offsets
+                pred_offsets = pred_grouped_offsets
+            elif self.use_toproi_simcc_refiner and pred_simcc_x is not None and pred_simcc_y is not None:
                 pred_offsets = self._decode_simcc_offsets(
                     pred_simcc_x,
                     pred_simcc_y,
@@ -315,6 +339,8 @@ class PostProcessor(nn.Module):
             raw_has_picking_scores = F.sigmoid(pred_has_picking).squeeze(-1)
             has_picking_scores = raw_has_picking_scores
             picking_offsets = pred_offsets
+            if grouped_picking_offsets is None and pred_grouped_offsets is not None:
+                grouped_picking_offsets = pred_grouped_offsets
             if pred_point_quality is not None:
                 point_quality_scores = F.sigmoid(pred_point_quality).squeeze(-1)
                 point_final_scores = raw_has_picking_scores * point_quality_scores.clamp(min=0.0, max=1.0).pow(
@@ -336,8 +362,17 @@ class PostProcessor(nn.Module):
                 )
                 if self.point_visibility_score_mode == "accept":
                     has_picking_scores = point_accept_final_scores
+            if pred_point_reliability is not None:
+                point_reliability_scores = F.sigmoid(pred_point_reliability).squeeze(-1)
+                point_reliability_final_scores = raw_has_picking_scores * point_reliability_scores.clamp(
+                    min=0.0,
+                    max=1.0,
+                ).pow(self.point_reliability_score_alpha)
+                if self.point_visibility_score_mode == "reliability":
+                    has_picking_scores = point_reliability_final_scores
             if pred_weak_heatmap is not None:
                 weak_heatmap_scores = F.sigmoid(pred_weak_heatmap).squeeze(-1)
+            visible_scores = has_picking_scores
             has_picking_flags = has_picking_scores >= self.has_picking_threshold
 
         # TODO for onnx export
@@ -357,16 +392,21 @@ class PostProcessor(nn.Module):
                 labels,
                 boxes,
                 scores,
+                raw_has_picking_scores,
                 has_picking_scores,
+                visible_scores,
                 has_picking_flags,
                 picking_points,
                 picking_offsets,
+                grouped_picking_offsets if grouped_picking_offsets is not None else [None] * len(labels),
                 point_quality_scores if point_quality_scores is not None else [None] * len(labels),
                 point_final_scores if point_final_scores is not None else [None] * len(labels),
                 point_selector_scores if point_selector_scores is not None else [None] * len(labels),
                 point_selector_final_scores if point_selector_final_scores is not None else [None] * len(labels),
                 point_accept_scores if point_accept_scores is not None else [None] * len(labels),
                 point_accept_final_scores if point_accept_final_scores is not None else [None] * len(labels),
+                point_reliability_scores if point_reliability_scores is not None else [None] * len(labels),
+                point_reliability_final_scores if point_reliability_final_scores is not None else [None] * len(labels),
                 weak_heatmap_scores if weak_heatmap_scores is not None else [None] * len(labels),
             )
 
@@ -375,16 +415,20 @@ class PostProcessor(nn.Module):
                 lab, box, sco = items
                 result = dict(labels=lab, boxes=box, scores=sco)
             else:
-                lab, box, sco, has_score, has_flag, point_xy, offset_xy, quality_score, final_score, selector_score, selector_final_score, accept_score, accept_final_score, heatmap_score = items
+                lab, box, sco, raw_has_score, has_score, visible_score, has_flag, point_xy, offset_xy, grouped_offset_xy, quality_score, final_score, selector_score, selector_final_score, accept_score, accept_final_score, reliability_score, reliability_final_score, heatmap_score = items
                 result = dict(
                     labels=lab,
                     boxes=box,
                     scores=sco,
+                    raw_has_picking_scores=raw_has_score,
                     has_picking_scores=has_score,
+                    visible_scores=visible_score,
                     has_picking=has_flag,
                     picking_points=point_xy,
                     picking_offsets=offset_xy,
                 )
+                if grouped_offset_xy is not None:
+                    result["grouped_picking_offsets"] = grouped_offset_xy
                 if quality_score is not None:
                     result["point_quality_scores"] = quality_score
                 if final_score is not None:
@@ -397,6 +441,10 @@ class PostProcessor(nn.Module):
                     result["point_accept_scores"] = accept_score
                 if accept_final_score is not None:
                     result["point_accept_final_scores"] = accept_final_score
+                if reliability_score is not None:
+                    result["point_reliability_scores"] = reliability_score
+                if reliability_final_score is not None:
+                    result["point_reliability_final_scores"] = reliability_final_score
                 if heatmap_score is not None:
                     result["weak_heatmap_scores"] = heatmap_score
             results.append(result)

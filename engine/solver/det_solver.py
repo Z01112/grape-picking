@@ -317,6 +317,8 @@ class DetSolver(BaseSolver):
                 lr_warmup_scheduler=self.lr_warmup_scheduler,
                 writer=self.writer,
                 teacher_model=self.teacher_model, # NEW: Pass teacher model to train_one_epoch
+                has_logit_teacher_model=getattr(self, 'has_logit_teacher_model', None),
+                freeze_frozen_norm_eval=bool(self.cfg.yaml_cfg.get('freeze_frozen_norm_eval', False)),
             )
 
             if not self.self_lr_scheduler:  # update by epoch 
