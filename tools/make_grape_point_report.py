@@ -413,6 +413,8 @@ def _prediction_to_instances(prediction: dict) -> list[dict]:
     scores = prediction.get("scores", torch.zeros((boxes.shape[0],))).detach().cpu().to(torch.float32)
     labels = prediction.get("labels", torch.zeros((boxes.shape[0],), dtype=torch.int64)).detach().cpu()
     has_scores = prediction.get("has_picking_scores")
+    raw_has_scores = prediction.get("raw_has_picking_scores")
+    visible_scores = prediction.get("visible_scores")
     quality_scores = prediction.get("point_quality_scores")
     final_scores = prediction.get("point_final_scores")
     selector_scores = prediction.get("point_selector_scores")
@@ -422,10 +424,25 @@ def _prediction_to_instances(prediction: dict) -> list[dict]:
     reliability_scores = prediction.get("point_reliability_scores")
     reliability_final_scores = prediction.get("point_reliability_final_scores")
     weak_heatmap_scores = prediction.get("weak_heatmap_scores")
+    raw_offsets = prediction.get("raw_picking_offsets")
+    dpo_offsets = prediction.get("dpo_picking_offsets")
+    dpo_blend_offsets = prediction.get("dpo_blend_picking_offsets")
+    dpo_entropy_x = prediction.get("dpo_entropy_x")
+    dpo_entropy_y = prediction.get("dpo_entropy_y")
+    dpo_maxprob_x = prediction.get("dpo_maxprob_x")
+    dpo_maxprob_y = prediction.get("dpo_maxprob_y")
     if has_scores is None:
         has_scores = torch.zeros((boxes.shape[0],), dtype=torch.float32)
     else:
         has_scores = has_scores.detach().cpu().to(torch.float32)
+    if raw_has_scores is None:
+        raw_has_scores = has_scores
+    else:
+        raw_has_scores = raw_has_scores.detach().cpu().to(torch.float32)
+    if visible_scores is None:
+        visible_scores = has_scores
+    else:
+        visible_scores = visible_scores.detach().cpu().to(torch.float32)
     if quality_scores is not None:
         quality_scores = quality_scores.detach().cpu().to(torch.float32)
     if final_scores is not None:
@@ -444,6 +461,20 @@ def _prediction_to_instances(prediction: dict) -> list[dict]:
         reliability_final_scores = reliability_final_scores.detach().cpu().to(torch.float32)
     if weak_heatmap_scores is not None:
         weak_heatmap_scores = weak_heatmap_scores.detach().cpu().to(torch.float32)
+    if raw_offsets is not None:
+        raw_offsets = raw_offsets.detach().cpu().to(torch.float32)
+    if dpo_offsets is not None:
+        dpo_offsets = dpo_offsets.detach().cpu().to(torch.float32)
+    if dpo_blend_offsets is not None:
+        dpo_blend_offsets = dpo_blend_offsets.detach().cpu().to(torch.float32)
+    if dpo_entropy_x is not None:
+        dpo_entropy_x = dpo_entropy_x.detach().cpu().to(torch.float32)
+    if dpo_entropy_y is not None:
+        dpo_entropy_y = dpo_entropy_y.detach().cpu().to(torch.float32)
+    if dpo_maxprob_x is not None:
+        dpo_maxprob_x = dpo_maxprob_x.detach().cpu().to(torch.float32)
+    if dpo_maxprob_y is not None:
+        dpo_maxprob_y = dpo_maxprob_y.detach().cpu().to(torch.float32)
     points = prediction.get("picking_points")
     if points is None:
         points = torch.zeros((boxes.shape[0], 2), dtype=torch.float32)
@@ -456,7 +487,9 @@ def _prediction_to_instances(prediction: dict) -> list[dict]:
             "bbox_xyxy": [float(v) for v in boxes[idx].tolist()],
             "score": float(scores[idx].item()),
             "label": int(labels[idx].item()),
+            "raw_has_picking_score": float(raw_has_scores[idx].item()),
             "has_picking_score": float(has_scores[idx].item()),
+            "visible_score": float(visible_scores[idx].item()),
             "picking_point": [float(v) for v in points[idx].tolist()],
         }
         if quality_scores is not None:
@@ -477,6 +510,20 @@ def _prediction_to_instances(prediction: dict) -> list[dict]:
             item["point_reliability_final_score"] = float(reliability_final_scores[idx].item())
         if weak_heatmap_scores is not None:
             item["weak_heatmap_score"] = float(weak_heatmap_scores[idx].item())
+        if raw_offsets is not None:
+            item["raw_picking_offset"] = [float(v) for v in raw_offsets[idx].tolist()]
+        if dpo_offsets is not None:
+            item["dpo_picking_offset"] = [float(v) for v in dpo_offsets[idx].tolist()]
+        if dpo_blend_offsets is not None:
+            item["dpo_blend_picking_offset"] = [float(v) for v in dpo_blend_offsets[idx].tolist()]
+        if dpo_entropy_x is not None:
+            item["dpo_entropy_x"] = float(dpo_entropy_x[idx].item())
+        if dpo_entropy_y is not None:
+            item["dpo_entropy_y"] = float(dpo_entropy_y[idx].item())
+        if dpo_maxprob_x is not None:
+            item["dpo_maxprob_x"] = float(dpo_maxprob_x[idx].item())
+        if dpo_maxprob_y is not None:
+            item["dpo_maxprob_y"] = float(dpo_maxprob_y[idx].item())
         instances.append(item)
     return instances
 

@@ -111,6 +111,14 @@ class RTv4Criterion(nn.Module):
                   point_lsd_offset_mode='top_center',
                   point_lsd_top_anchor_ratio=0.12,
                   point_lsd_anchor_x_ratio=0.5,
+                  dpo_num_bins_x=96,
+                  dpo_num_bins_y=96,
+                  dpo_x_min=-1.0,
+                  dpo_x_max=1.0,
+                  dpo_y_min=-1.0,
+                  dpo_y_max=1.0,
+                  dpo_soft_sigma=1.5,
+                  dpo_expectation_l1_beta=1.0,
                   has_logit_distill_loss_type='mse',
                   ):
         """Create the criterion.
@@ -219,6 +227,18 @@ class RTv4Criterion(nn.Module):
         self.point_lsd_offset_mode = str(point_lsd_offset_mode)
         self.point_lsd_top_anchor_ratio = float(point_lsd_top_anchor_ratio)
         self.point_lsd_anchor_x_ratio = float(point_lsd_anchor_x_ratio)
+        self.dpo_num_bins_x = max(int(dpo_num_bins_x), 2)
+        self.dpo_num_bins_y = max(int(dpo_num_bins_y), 2)
+        self.dpo_x_min = float(dpo_x_min)
+        self.dpo_x_max = float(dpo_x_max)
+        self.dpo_y_min = float(dpo_y_min)
+        self.dpo_y_max = float(dpo_y_max)
+        if self.dpo_x_max <= self.dpo_x_min:
+            self.dpo_x_max = self.dpo_x_min + 1.0
+        if self.dpo_y_max <= self.dpo_y_min:
+            self.dpo_y_max = self.dpo_y_min + 1.0
+        self.dpo_soft_sigma = max(float(dpo_soft_sigma), 1e-6)
+        self.dpo_expectation_l1_beta = max(float(dpo_expectation_l1_beta), 1e-6)
         self.has_logit_distill_loss_type = str(has_logit_distill_loss_type).strip().lower()
         if self.has_logit_distill_loss_type not in ('mse', 'smooth_l1'):
             raise ValueError(f"Unsupported has_logit_distill_loss_type: {has_logit_distill_loss_type}")
@@ -305,7 +325,7 @@ class RTv4Criterion(nn.Module):
         fixed_weight = self.weight_dict.get('loss_distill', 0.0)
         return fixed_weight
 
-    def loss_labels_focal(self, outputs, targets, indices, num_boxes):
+    def loss_labels_focal(self, outputs, targets, indices, num_boxes, **kwargs):
         assert 'pred_logits' in outputs
         src_logits = outputs['pred_logits']
         idx = self._get_src_permutation_idx(indices)
@@ -319,7 +339,7 @@ class RTv4Criterion(nn.Module):
 
         return {'loss_focal': loss}
 
-    def loss_labels_vfl(self, outputs, targets, indices, num_boxes, values=None):
+    def loss_labels_vfl(self, outputs, targets, indices, num_boxes, values=None, **kwargs):
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
         if values is None:
@@ -348,7 +368,7 @@ class RTv4Criterion(nn.Module):
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
         return {'loss_vfl': loss}
 
-    def loss_labels_mal(self, outputs, targets, indices, num_boxes, values=None):
+    def loss_labels_mal(self, outputs, targets, indices, num_boxes, values=None, **kwargs):
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
         if values is None:
@@ -382,7 +402,7 @@ class RTv4Criterion(nn.Module):
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
         return {'loss_mal': loss}
 
-    def loss_boxes(self, outputs, targets, indices, num_boxes, boxes_weight=None):
+    def loss_boxes(self, outputs, targets, indices, num_boxes, boxes_weight=None, **kwargs):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
            The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
@@ -402,7 +422,7 @@ class RTv4Criterion(nn.Module):
 
         return losses
 
-    def loss_local(self, outputs, targets, indices, num_boxes, T=5):
+    def loss_local(self, outputs, targets, indices, num_boxes, T=5, **kwargs):
         """Compute Fine-Grained Localization (FGL) Loss
             and Decoupled Distillation Focal (DDF) Loss. """
 
@@ -697,6 +717,83 @@ class RTv4Criterion(nn.Module):
 
         loss = (point_loss * sample_weights).sum() / max(int(valid.sum().item()), 1)
         return {'loss_picking_offset': loss}
+
+    def _dpo_soft_target(self, values: torch.Tensor, axis: str) -> torch.Tensor:
+        if axis == 'x':
+            bins = torch.linspace(
+                self.dpo_x_min,
+                self.dpo_x_max,
+                self.dpo_num_bins_x,
+                device=values.device,
+                dtype=values.dtype,
+            )
+        else:
+            bins = torch.linspace(
+                self.dpo_y_min,
+                self.dpo_y_max,
+                self.dpo_num_bins_y,
+                device=values.device,
+                dtype=values.dtype,
+            )
+        if values.numel() == 0:
+            return values.new_zeros((0, bins.numel()))
+        if bins.numel() > 1:
+            bin_step = (bins[-1] - bins[0]).abs() / (bins.numel() - 1)
+        else:
+            bin_step = values.new_tensor(1.0)
+        sigma = self.dpo_soft_sigma * bin_step.clamp_min(1e-6)
+        target = torch.exp(-0.5 * ((bins.view(1, -1) - values.view(-1, 1)) / sigma) ** 2)
+        return target / target.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    def loss_dpo(self, outputs, targets, indices, num_boxes, **kwargs):
+        """Distributional point-offset loss for final matched visible queries only."""
+        required = ('pred_dpo_logits_x', 'pred_dpo_logits_y', 'pred_dpo_offsets')
+        if any(key not in outputs for key in required):
+            return {}
+        idx = self._get_src_permutation_idx(indices)
+        logits_x = outputs['pred_dpo_logits_x'][idx]
+        logits_y = outputs['pred_dpo_logits_y'][idx]
+        pred_offsets = outputs['pred_dpo_offsets'][idx]
+        if logits_x.numel() == 0:
+            zero = outputs['pred_dpo_logits_x'].sum() * 0.0
+            return {
+                'loss_dpo_x': zero,
+                'loss_dpo_y': zero,
+                'loss_dpo_expectation_l1': zero,
+            }
+
+        target_has_picking = torch.cat(
+            [t['has_picking'][j] for t, (_, j) in zip(targets, indices)],
+            dim=0,
+        ).to(dtype=pred_offsets.dtype, device=pred_offsets.device)
+        target_offsets = torch.cat(
+            [t['picking_offsets'][j] for t, (_, j) in zip(targets, indices)],
+            dim=0,
+        ).to(dtype=pred_offsets.dtype, device=pred_offsets.device)
+        valid = target_has_picking > 0.5
+        if not valid.any():
+            zero = outputs['pred_dpo_logits_x'].sum() * 0.0
+            return {
+                'loss_dpo_x': zero,
+                'loss_dpo_y': zero,
+                'loss_dpo_expectation_l1': zero,
+            }
+
+        target_x = self._dpo_soft_target(target_offsets[valid, 0], 'x')
+        target_y = self._dpo_soft_target(target_offsets[valid, 1], 'y')
+        loss_x = -(target_x * F.log_softmax(logits_x[valid].float(), dim=-1)).sum(dim=-1).mean()
+        loss_y = -(target_y * F.log_softmax(logits_y[valid].float(), dim=-1)).sum(dim=-1).mean()
+        loss_expectation = F.smooth_l1_loss(
+            pred_offsets[valid].float(),
+            target_offsets[valid].float(),
+            reduction='none',
+            beta=self.dpo_expectation_l1_beta,
+        ).sum(dim=-1).mean()
+        return {
+            'loss_dpo_x': loss_x,
+            'loss_dpo_y': loss_y,
+            'loss_dpo_expectation_l1': loss_expectation,
+        }
 
     def loss_grouped_picking_offset(self, outputs, targets, indices, num_boxes, **kwargs):
         """Offset loss for the grouped single-keypoint picking query branch."""
@@ -1536,6 +1633,7 @@ class RTv4Criterion(nn.Module):
             'local': self.loss_local,
             'has_picking': self.loss_has_picking,
             'picking_offset': self.loss_picking_offset,
+            'dpo': self.loss_dpo,
             'grouped_picking_offset': self.loss_grouped_picking_offset,
             'point_lsd': self.loss_point_lsd,
             'picking_locality': self.loss_picking_locality,
@@ -1601,7 +1699,7 @@ class RTv4Criterion(nn.Module):
 
         # Compute all the requested losses, main loss
         losses = {}
-        main_only_losses = {'point_lsd', 'picking_locality', 'point_selector', 'point_accept', 'point_reliability', 'toproi_heatmap', 'has_logit_distill'}
+        main_only_losses = {'dpo', 'point_lsd', 'picking_locality', 'point_selector', 'point_accept', 'point_reliability', 'toproi_heatmap', 'has_logit_distill'}
         for loss_name in self.losses:
             # TODO, indices and num_box are different from RT-DETRv2
             if loss_name == 'distill':

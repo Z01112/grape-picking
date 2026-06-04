@@ -19,6 +19,7 @@ from ..optim import ModelEMA, Warmup
 from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
 
+
 def _set_frozen_norm_eval(module: torch.nn.Module) -> None:
     norm_types = (
         torch.nn.BatchNorm1d,
@@ -160,8 +161,14 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
             if lr_warmup_scheduler is not None:
                 lr_warmup_scheduler.step()
 
-        loss_dict_reduced = dist_utils.reduce_dict(loss_dict)
-        loss_value = sum(loss_dict_reduced.values())
+        # Keep logging and tensorboard bookkeeping out of the autograd graph.
+        loss_dict_for_log = {
+            k: v.detach() if torch.is_tensor(v) else torch.as_tensor(v, device=device)
+            for k, v in loss_dict.items()
+        }
+        loss_dict_reduced = dist_utils.reduce_dict(loss_dict_for_log)
+        loss_value_tensor = sum(loss_dict_reduced.values())
+        loss_value = float(loss_value_tensor.item() if torch.is_tensor(loss_value_tensor) else loss_value_tensor)
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
@@ -172,7 +179,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         if writer and dist_utils.is_main_process() and global_step % 10 == 0:
-            writer.add_scalar('Loss/total', loss_value.item(), global_step)
+            writer.add_scalar('Loss/total', loss_value, global_step)
             for j, pg in enumerate(optimizer.param_groups):
                 writer.add_scalar(f'Lr/pg_{j}', pg['lr'], global_step)
             for k, v in loss_dict_reduced.items():

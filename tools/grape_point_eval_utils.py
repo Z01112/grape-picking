@@ -88,6 +88,11 @@ def prediction_to_instances(prediction: dict) -> list[dict]:
     has_scores = prediction.get("has_picking_scores")
     visible_scores = prediction.get("visible_scores")
     points = prediction.get("picking_points")
+    vector_tensor_keys = {
+        "raw_picking_offset": prediction.get("raw_picking_offsets"),
+        "dpo_picking_offset": prediction.get("dpo_picking_offsets"),
+        "dpo_blend_picking_offset": prediction.get("dpo_blend_picking_offsets"),
+    }
 
     if raw_has_scores is None:
         raw_has_scores = has_scores
@@ -120,10 +125,18 @@ def prediction_to_instances(prediction: dict) -> list[dict]:
         "point_reliability_score": prediction.get("point_reliability_scores"),
         "point_reliability_final_score": prediction.get("point_reliability_final_scores"),
         "weak_heatmap_score": prediction.get("weak_heatmap_scores"),
+        "dpo_entropy_x": prediction.get("dpo_entropy_x"),
+        "dpo_entropy_y": prediction.get("dpo_entropy_y"),
+        "dpo_maxprob_x": prediction.get("dpo_maxprob_x"),
+        "dpo_maxprob_y": prediction.get("dpo_maxprob_y"),
     }
     optional_tensor_keys = {
         key: value.detach().cpu().to(torch.float32) if value is not None else None
         for key, value in optional_tensor_keys.items()
+    }
+    vector_tensor_keys = {
+        key: value.detach().cpu().to(torch.float32) if value is not None else None
+        for key, value in vector_tensor_keys.items()
     }
 
     instances: list[dict] = []
@@ -143,6 +156,9 @@ def prediction_to_instances(prediction: dict) -> list[dict]:
         for key, value in optional_tensor_keys.items():
             if value is not None:
                 item[key] = float(value[idx].item())
+        for key, value in vector_tensor_keys.items():
+            if value is not None:
+                item[key] = [float(v) for v in value[idx].tolist()]
         instances.append(item)
     return instances
 

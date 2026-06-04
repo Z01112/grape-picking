@@ -16,7 +16,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from tools.grape_point_eval_utils import compute_unified_point_metrics
 from tools.make_grape_point_report import evaluate_split, summarize_split_error
-from tools.check_grouped_query_decision import extract_metrics, load_json
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +44,50 @@ def l2_fail_count(pair_count: int, ppl_sr: float) -> int:
     if pair_count <= 0 or not math.isfinite(ppl_sr):
         return 0
     return int(pair_count - round(pair_count * ppl_sr))
+
+
+def load_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _get_split_summary(payload: dict[str, Any], split: str) -> dict[str, Any]:
+    split_summary = payload.get("primary_checkpoint_split_summary", {})
+    if isinstance(split_summary, dict) and isinstance(split_summary.get(split), dict):
+        return split_summary[split]
+    if isinstance(payload.get(split), dict):
+        return payload[split]
+    return {}
+
+
+def extract_metrics(payload: dict[str, Any], split: str = "test") -> dict[str, Any] | None:
+    split_summary = _get_split_summary(payload, split)
+    if not split_summary:
+        return None
+
+    det = split_summary.get("grape_detection", {})
+    has = split_summary.get("has_picking", {})
+    point = split_summary.get("picking_point", {})
+    unified = payload.get("unified_point_metrics", {}).get(split, {})
+    global_chain = unified.get("global_chain", {}) if isinstance(unified, dict) else {}
+    point_unified = unified.get("point", {}) if isinstance(unified, dict) else {}
+
+    pair = int(point.get("pair_count", point_unified.get("point_pair_count", 0)) or 0)
+    ppl30 = safe_float(point.get("ppl_sr_30", point_unified.get("ppl_sr_30")))
+    ppl50 = safe_float(point.get("ppl_sr_50", point_unified.get("ppl_sr_50")))
+    return {
+        "AP": safe_float(det.get("AP")),
+        "AP50": safe_float(det.get("AP50")),
+        "instance_f1": safe_float(has.get("f1")),
+        "pair_count": pair,
+        "global_visible_recall": safe_float(global_chain.get("global_visible_recall")),
+        "mean_L2": safe_float(point.get("mean_l2_px", point_unified.get("point_mean_l2_px"))),
+        "median_L2": safe_float(point.get("median_l2_px", point_unified.get("point_median_l2_px"))),
+        "p90_L2": safe_float(point.get("p90_l2_px", point_unified.get("point_p90_l2_px"))),
+        "PPL-SR@30": ppl30,
+        "PPL-SR@50": ppl50,
+        "L2>30_count": l2_fail_count(pair, ppl30),
+        "L2>50_count": l2_fail_count(pair, ppl50),
+    }
 
 
 def checkpoint_epoch(path: Path) -> int | None:

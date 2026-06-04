@@ -1,0 +1,60 @@
+__include__: [
+  ./rtv4_hgnetv2_s_grape_point_enc_ema_bifpn_weighted_fusion.yml
+]
+
+output_dir: ./outputs/01_mainline_results/candidate_ema_bifpn_qdpt_lite_v1_probe20
+epoches: 20
+checkpoint_freq: 2
+use_ema: false
+find_unused_parameters: true
+freeze_frozen_norm_eval: true
+
+trainable_keywords:
+  - decoder.qdpt_level_embed
+  - decoder.pre_qdpt_
+  - decoder.dec_qdpt_
+  - decoder.pre_picking_offset_head
+  - decoder.dec_picking_offset_head
+
+has_logit_distill_teacher:
+  enabled: true
+
+optimizer:
+  type: AdamW
+  params:
+    - params: qdpt
+      lr: 0.0002
+    - params: picking_offset_head
+      lr: 0.0001
+  lr: 0.0001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+DFINETransformer:
+  use_qdpt_lite: true
+  qdpt_offset_only: true
+  qdpt_num_heads: 4
+  qdpt_dropout: 0.0
+  qdpt_toproi_levels: [0, 1]
+  qdpt_toproi_map_size: 5
+  qdpt_use_multilevel_toproi: true
+  qdpt_use_point_prior: true
+  qdpt_prior_residual: true
+  qdpt_init_identity: true
+  qdpt_use_has_distill: true
+  qdpt_debug_fields: true
+
+RTv4Criterion:
+  weight_dict:
+    loss_vfl: 1
+    loss_bbox: 5
+    loss_giou: 2
+    loss_fgl: 0.15
+    loss_ddf: 1.5
+    loss_mal: 1
+    loss_distill: 10.0
+    loss_has_picking: 1.2
+    loss_picking_offset: 4.0
+    loss_has_logit_distill: 0.1
+  losses: [mal, boxes, local, has_picking, picking_offset, has_logit_distill]
+  has_logit_distill_loss_type: smooth_l1

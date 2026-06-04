@@ -61,6 +61,8 @@ class PostProcessor(nn.Module):
         toproi_heatmap_y_min=-0.35,
         toproi_heatmap_y_max=0.45,
         use_grouped_picking_offsets=False,
+        dpo_inference_mode="raw_offset",
+        dpo_debug_fields=False,
     ) -> None:
         super().__init__()
         self.use_focal_loss = use_focal_loss
@@ -92,6 +94,13 @@ class PostProcessor(nn.Module):
         self.toproi_heatmap_y_min = float(toproi_heatmap_y_min)
         self.toproi_heatmap_y_max = float(toproi_heatmap_y_max)
         self.use_grouped_picking_offsets = bool(use_grouped_picking_offsets)
+        self.dpo_inference_mode = str(dpo_inference_mode).strip().lower()
+        if self.dpo_inference_mode not in {"raw_offset", "dpo_expectation", "blend"}:
+            raise ValueError(
+                f"Unsupported dpo_inference_mode={dpo_inference_mode!r}; "
+                "expected 'raw_offset', 'dpo_expectation', or 'blend'."
+            )
+        self.dpo_debug_fields = bool(dpo_debug_fields)
         if self.toproi_simcc_x_max <= self.toproi_simcc_x_min:
             self.toproi_simcc_x_max = self.toproi_simcc_x_min + 1.0
         if self.toproi_simcc_y_max <= self.toproi_simcc_y_min:
@@ -178,6 +187,13 @@ class PostProcessor(nn.Module):
         point_reliability_scores = None
         point_reliability_final_scores = None
         weak_heatmap_scores = None
+        raw_picking_offsets = None
+        dpo_picking_offsets = None
+        dpo_blend_picking_offsets = None
+        dpo_entropy_x = None
+        dpo_entropy_y = None
+        dpo_maxprob_x = None
+        dpo_maxprob_y = None
 
         if self.use_focal_loss:
             scores = F.sigmoid(logits)
@@ -219,6 +235,12 @@ class PostProcessor(nn.Module):
             pred_simcc_x = outputs.get('pred_toproi_simcc_x')
             pred_simcc_y = outputs.get('pred_toproi_simcc_y')
             pred_toproi_heatmap = outputs.get('pred_toproi_heatmap')
+            pred_dpo_offsets = outputs.get('pred_dpo_offsets')
+            pred_dpo_blend_offsets = outputs.get('pred_dpo_blend_offsets')
+            pred_dpo_entropy_x = outputs.get('dpo_entropy_x')
+            pred_dpo_entropy_y = outputs.get('dpo_entropy_y')
+            pred_dpo_maxprob_x = outputs.get('dpo_maxprob_x')
+            pred_dpo_maxprob_y = outputs.get('dpo_maxprob_y')
 
             # Keep point outputs aligned with the same top-k grape queries used
             # for labels/scores/boxes.
@@ -278,7 +300,30 @@ class PostProcessor(nn.Module):
                             1, 1, pred_toproi_heatmap.shape[-2], pred_toproi_heatmap.shape[-1]
                         ),
                     )
+                if pred_dpo_offsets is not None:
+                    pred_dpo_offsets = pred_dpo_offsets.gather(
+                        dim=1,
+                        index=index.unsqueeze(-1).repeat(1, 1, pred_dpo_offsets.shape[-1]),
+                    )
+                if pred_dpo_blend_offsets is not None:
+                    pred_dpo_blend_offsets = pred_dpo_blend_offsets.gather(
+                        dim=1,
+                        index=index.unsqueeze(-1).repeat(1, 1, pred_dpo_blend_offsets.shape[-1]),
+                    )
+                if pred_dpo_entropy_x is not None:
+                    pred_dpo_entropy_x = pred_dpo_entropy_x.gather(dim=1, index=index)
+                if pred_dpo_entropy_y is not None:
+                    pred_dpo_entropy_y = pred_dpo_entropy_y.gather(dim=1, index=index)
+                if pred_dpo_maxprob_x is not None:
+                    pred_dpo_maxprob_x = pred_dpo_maxprob_x.gather(dim=1, index=index)
+                if pred_dpo_maxprob_y is not None:
+                    pred_dpo_maxprob_y = pred_dpo_maxprob_y.gather(dim=1, index=index)
 
+            raw_picking_offsets = pred_offsets
+            if pred_dpo_offsets is not None:
+                dpo_picking_offsets = pred_dpo_offsets
+            if pred_dpo_blend_offsets is not None:
+                dpo_blend_picking_offsets = pred_dpo_blend_offsets
             if self.use_grouped_picking_offsets and pred_grouped_offsets is not None:
                 grouped_picking_offsets = pred_grouped_offsets
                 pred_offsets = pred_grouped_offsets
@@ -299,6 +344,10 @@ class PostProcessor(nn.Module):
                     self.toproi_heatmap_y_min,
                     self.toproi_heatmap_y_max,
                 ).to(dtype=pred_offsets.dtype)
+            elif self.dpo_inference_mode == "dpo_expectation" and pred_dpo_offsets is not None:
+                pred_offsets = pred_dpo_offsets.to(dtype=pred_offsets.dtype)
+            elif self.dpo_inference_mode == "blend" and pred_dpo_blend_offsets is not None:
+                pred_offsets = pred_dpo_blend_offsets.to(dtype=pred_offsets.dtype)
 
             if any(v is not None for v in (self.point_decode_clamp_x_abs, self.point_decode_clamp_y_min, self.point_decode_clamp_y_max)):
                 pred_offsets = pred_offsets.clone()
@@ -372,6 +421,11 @@ class PostProcessor(nn.Module):
                     has_picking_scores = point_reliability_final_scores
             if pred_weak_heatmap is not None:
                 weak_heatmap_scores = F.sigmoid(pred_weak_heatmap).squeeze(-1)
+            if self.dpo_debug_fields:
+                dpo_entropy_x = pred_dpo_entropy_x
+                dpo_entropy_y = pred_dpo_entropy_y
+                dpo_maxprob_x = pred_dpo_maxprob_x
+                dpo_maxprob_y = pred_dpo_maxprob_y
             visible_scores = has_picking_scores
             has_picking_flags = has_picking_scores >= self.has_picking_threshold
 
@@ -408,6 +462,13 @@ class PostProcessor(nn.Module):
                 point_reliability_scores if point_reliability_scores is not None else [None] * len(labels),
                 point_reliability_final_scores if point_reliability_final_scores is not None else [None] * len(labels),
                 weak_heatmap_scores if weak_heatmap_scores is not None else [None] * len(labels),
+                raw_picking_offsets if raw_picking_offsets is not None else [None] * len(labels),
+                dpo_picking_offsets if dpo_picking_offsets is not None else [None] * len(labels),
+                dpo_blend_picking_offsets if dpo_blend_picking_offsets is not None else [None] * len(labels),
+                dpo_entropy_x if dpo_entropy_x is not None else [None] * len(labels),
+                dpo_entropy_y if dpo_entropy_y is not None else [None] * len(labels),
+                dpo_maxprob_x if dpo_maxprob_x is not None else [None] * len(labels),
+                dpo_maxprob_y if dpo_maxprob_y is not None else [None] * len(labels),
             )
 
         for items in zipped:
@@ -415,7 +476,7 @@ class PostProcessor(nn.Module):
                 lab, box, sco = items
                 result = dict(labels=lab, boxes=box, scores=sco)
             else:
-                lab, box, sco, raw_has_score, has_score, visible_score, has_flag, point_xy, offset_xy, grouped_offset_xy, quality_score, final_score, selector_score, selector_final_score, accept_score, accept_final_score, reliability_score, reliability_final_score, heatmap_score = items
+                lab, box, sco, raw_has_score, has_score, visible_score, has_flag, point_xy, offset_xy, grouped_offset_xy, quality_score, final_score, selector_score, selector_final_score, accept_score, accept_final_score, reliability_score, reliability_final_score, heatmap_score, raw_offset_xy, dpo_offset_xy, dpo_blend_offset_xy, dpo_entropy_x_i, dpo_entropy_y_i, dpo_maxprob_x_i, dpo_maxprob_y_i = items
                 result = dict(
                     labels=lab,
                     boxes=box,
@@ -427,6 +488,12 @@ class PostProcessor(nn.Module):
                     picking_points=point_xy,
                     picking_offsets=offset_xy,
                 )
+                if raw_offset_xy is not None:
+                    result["raw_picking_offsets"] = raw_offset_xy
+                if dpo_offset_xy is not None:
+                    result["dpo_picking_offsets"] = dpo_offset_xy
+                if dpo_blend_offset_xy is not None:
+                    result["dpo_blend_picking_offsets"] = dpo_blend_offset_xy
                 if grouped_offset_xy is not None:
                     result["grouped_picking_offsets"] = grouped_offset_xy
                 if quality_score is not None:
@@ -447,6 +514,14 @@ class PostProcessor(nn.Module):
                     result["point_reliability_final_scores"] = reliability_final_score
                 if heatmap_score is not None:
                     result["weak_heatmap_scores"] = heatmap_score
+                if dpo_entropy_x_i is not None:
+                    result["dpo_entropy_x"] = dpo_entropy_x_i
+                if dpo_entropy_y_i is not None:
+                    result["dpo_entropy_y"] = dpo_entropy_y_i
+                if dpo_maxprob_x_i is not None:
+                    result["dpo_maxprob_x"] = dpo_maxprob_x_i
+                if dpo_maxprob_y_i is not None:
+                    result["dpo_maxprob_y"] = dpo_maxprob_y_i
             results.append(result)
 
         return results

@@ -509,6 +509,31 @@ class DFINETransformer(nn.Module):
                  grouped_picking_use_toproi=True,
                  grouped_picking_use_box_geometry=True,
                  grouped_picking_residual_offset=False,
+                 use_qdpt_lite=False,
+                 qdpt_offset_only=True,
+                 qdpt_num_heads=4,
+                 qdpt_dropout=0.0,
+                 qdpt_toproi_levels=[0, 1],
+                 qdpt_toproi_map_size=5,
+                 qdpt_use_multilevel_toproi=True,
+                 qdpt_use_point_prior=True,
+                 qdpt_prior_residual=True,
+                 qdpt_init_identity=True,
+                 qdpt_use_has_distill=True,
+                 qdpt_debug_fields=True,
+                 use_dpo_head=False,
+                 dpo_num_bins_x=96,
+                 dpo_num_bins_y=96,
+                 dpo_x_min=None,
+                 dpo_x_max=None,
+                 dpo_y_min=None,
+                 dpo_y_max=None,
+                 dpo_target_type='soft_ce',
+                 dpo_soft_sigma=1.5,
+                 dpo_use_expectation_decode=True,
+                 dpo_inference_mode='raw_offset',
+                 dpo_blend_init=0.0,
+                 dpo_debug_fields=True,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -606,6 +631,41 @@ class DFINETransformer(nn.Module):
         self.grouped_picking_use_toproi = bool(grouped_picking_use_toproi)
         self.grouped_picking_use_box_geometry = bool(grouped_picking_use_box_geometry)
         self.grouped_picking_residual_offset = bool(grouped_picking_residual_offset)
+        self.use_qdpt_lite = bool(use_qdpt_lite)
+        self.qdpt_offset_only = bool(qdpt_offset_only)
+        self.qdpt_num_heads = max(int(qdpt_num_heads), 1)
+        self.qdpt_dropout = float(qdpt_dropout)
+        if isinstance(qdpt_toproi_levels, int):
+            qdpt_toproi_levels = [qdpt_toproi_levels]
+        self.qdpt_toproi_levels = [max(int(level), 0) for level in qdpt_toproi_levels]
+        if not self.qdpt_toproi_levels:
+            self.qdpt_toproi_levels = [self.point_local_feature_level]
+        self.qdpt_toproi_map_size = max(int(qdpt_toproi_map_size), 2)
+        self.qdpt_use_multilevel_toproi = bool(qdpt_use_multilevel_toproi)
+        self.qdpt_use_point_prior = bool(qdpt_use_point_prior)
+        self.qdpt_prior_residual = bool(qdpt_prior_residual)
+        self.qdpt_init_identity = bool(qdpt_init_identity)
+        self.qdpt_use_has_distill = bool(qdpt_use_has_distill)
+        self.qdpt_debug_fields = bool(qdpt_debug_fields)
+        self._qdpt_runtime_warnings = set()
+        self.use_dpo_head = bool(use_dpo_head)
+        self.dpo_num_bins_x = max(int(dpo_num_bins_x), 2)
+        self.dpo_num_bins_y = max(int(dpo_num_bins_y), 2)
+        self.dpo_x_min = -1.0 if dpo_x_min is None else float(dpo_x_min)
+        self.dpo_x_max = 1.0 if dpo_x_max is None else float(dpo_x_max)
+        self.dpo_y_min = -1.0 if dpo_y_min is None else float(dpo_y_min)
+        self.dpo_y_max = 1.0 if dpo_y_max is None else float(dpo_y_max)
+        if self.dpo_x_max <= self.dpo_x_min:
+            self.dpo_x_max = self.dpo_x_min + 1.0
+        if self.dpo_y_max <= self.dpo_y_min:
+            self.dpo_y_max = self.dpo_y_min + 1.0
+        self.dpo_target_type = str(dpo_target_type).strip().lower()
+        self.dpo_soft_sigma = max(float(dpo_soft_sigma), 1e-6)
+        self.dpo_use_expectation_decode = bool(dpo_use_expectation_decode)
+        self.dpo_inference_mode = str(dpo_inference_mode).strip().lower()
+        if self.dpo_inference_mode not in ('raw_offset', 'dpo_expectation', 'blend'):
+            raise ValueError(f"Unsupported dpo_inference_mode: {dpo_inference_mode}")
+        self.dpo_debug_fields = bool(dpo_debug_fields)
         # GPPoint-DETR keeps the detector queries intact and changes only how
         # the per-query point feature is enriched before has/offset prediction.
         self.point_legacy_local_feature = self.point_instance_binding_mode == 'legacy' and self.point_local_feature_fusion
@@ -707,6 +767,24 @@ class DFINETransformer(nn.Module):
         self.pre_point_box_geom_proj = None
         self.dec_point_fusion_head = None
         self.pre_point_fusion_head = None
+        self.dec_qdpt_query_pos_proj = None
+        self.pre_qdpt_query_pos_proj = None
+        self.dec_qdpt_attn = None
+        self.pre_qdpt_attn = None
+        self.dec_qdpt_norm = None
+        self.pre_qdpt_norm = None
+        self.dec_qdpt_delta_head = None
+        self.pre_qdpt_delta_head = None
+        self.dec_qdpt_prior_head = None
+        self.pre_qdpt_prior_head = None
+        self.dec_qdpt_gate = None
+        self.pre_qdpt_gate = None
+        self.qdpt_level_embed = None
+        self.dec_dpo_x_head = None
+        self.dec_dpo_y_head = None
+        self.pre_dpo_x_head = None
+        self.pre_dpo_y_head = None
+        self.dpo_blend_alpha = None
         if self.use_picking_point_head:
             # Per-grape-query picking heads: has_picking classifies whether the
             # matched grape has a visible picking point, while point_offset
@@ -1032,6 +1110,93 @@ class DFINETransformer(nn.Module):
                         for _ in range(num_layers - self.eval_idx - 1)
                     ]
                 )
+            if self.use_qdpt_lite:
+                if hidden_dim % self.qdpt_num_heads != 0:
+                    raise ValueError(
+                        f"qdpt_num_heads={self.qdpt_num_heads} must divide hidden_dim={hidden_dim}"
+                    )
+                self.qdpt_level_embed = nn.Embedding(max(self.num_levels, max(self.qdpt_toproi_levels) + 1), hidden_dim)
+                self.pre_qdpt_query_pos_proj = nn.Linear(hidden_dim, hidden_dim)
+                self.dec_qdpt_query_pos_proj = nn.ModuleList(
+                    [nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)]
+                )
+                self.pre_qdpt_attn = nn.MultiheadAttention(
+                    hidden_dim,
+                    self.qdpt_num_heads,
+                    dropout=self.qdpt_dropout,
+                    batch_first=True,
+                )
+                self.dec_qdpt_attn = nn.ModuleList(
+                    [
+                        nn.MultiheadAttention(
+                            hidden_dim,
+                            self.qdpt_num_heads,
+                            dropout=self.qdpt_dropout,
+                            batch_first=True,
+                        )
+                        for _ in range(num_layers)
+                    ]
+                )
+                self.pre_qdpt_norm = nn.LayerNorm(hidden_dim)
+                self.dec_qdpt_norm = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+                self.pre_qdpt_delta_head = self._make_point_head(
+                    hidden_dim,
+                    point_hidden_dim,
+                    2,
+                    self.picking_offset_head_layers,
+                    mlp_act,
+                )
+                self.dec_qdpt_delta_head = nn.ModuleList(
+                    [
+                        self._make_point_head(hidden_dim, point_hidden_dim, 2, self.picking_offset_head_layers, mlp_act)
+                        for _ in range(num_layers)
+                    ]
+                )
+                self.pre_qdpt_prior_head = self._make_point_head(4, point_hidden_dim, 2, 2, mlp_act)
+                self.dec_qdpt_prior_head = nn.ModuleList(
+                    [self._make_point_head(4, point_hidden_dim, 2, 2, mlp_act) for _ in range(num_layers)]
+                )
+                init_gate = 1.0e-3 if self.qdpt_init_identity else 1.0
+                self.pre_qdpt_gate = nn.Parameter(torch.tensor(init_gate, dtype=torch.float32))
+                self.dec_qdpt_gate = nn.ParameterList(
+                    [nn.Parameter(torch.tensor(init_gate, dtype=torch.float32)) for _ in range(num_layers)]
+                )
+            if self.use_dpo_head:
+                self.pre_dpo_x_head = self._make_point_head(
+                    hidden_dim,
+                    point_hidden_dim,
+                    self.dpo_num_bins_x,
+                    self.picking_offset_head_layers,
+                    mlp_act,
+                )
+                self.pre_dpo_y_head = self._make_point_head(
+                    hidden_dim,
+                    point_hidden_dim,
+                    self.dpo_num_bins_y,
+                    self.picking_offset_head_layers,
+                    mlp_act,
+                )
+                self.dec_dpo_x_head = nn.ModuleList(
+                    [
+                        self._make_point_head(hidden_dim, point_hidden_dim, self.dpo_num_bins_x, self.picking_offset_head_layers, mlp_act)
+                        for _ in range(self.eval_idx + 1)
+                    ]
+                  + [
+                        self._make_point_head(scaled_dim, point_hidden_dim_scaled, self.dpo_num_bins_x, self.picking_offset_head_layers, mlp_act)
+                        for _ in range(num_layers - self.eval_idx - 1)
+                    ]
+                )
+                self.dec_dpo_y_head = nn.ModuleList(
+                    [
+                        self._make_point_head(hidden_dim, point_hidden_dim, self.dpo_num_bins_y, self.picking_offset_head_layers, mlp_act)
+                        for _ in range(self.eval_idx + 1)
+                    ]
+                  + [
+                        self._make_point_head(scaled_dim, point_hidden_dim_scaled, self.dpo_num_bins_y, self.picking_offset_head_layers, mlp_act)
+                        for _ in range(num_layers - self.eval_idx - 1)
+                    ]
+                )
+                self.dpo_blend_alpha = nn.Parameter(torch.tensor(float(dpo_blend_init), dtype=torch.float32))
         self.pre_bbox_head = MLP(hidden_dim, hidden_dim, 4, 3, act=mlp_act)
         self.dec_bbox_head = nn.ModuleList(
             [MLP(hidden_dim, hidden_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(self.eval_idx + 1)]
@@ -1135,6 +1300,45 @@ class DFINETransformer(nn.Module):
             return offsets
         span = self.point_offset_max - self.point_offset_min
         return self.point_offset_min + span * torch.sigmoid(offsets)
+
+    def _decode_dpo_offsets(self, logits_x: torch.Tensor, logits_y: torch.Tensor) -> torch.Tensor:
+        dtype = logits_x.dtype
+        device = logits_x.device
+        x_bins = torch.linspace(self.dpo_x_min, self.dpo_x_max, logits_x.shape[-1], device=device, dtype=dtype)
+        y_bins = torch.linspace(self.dpo_y_min, self.dpo_y_max, logits_y.shape[-1], device=device, dtype=dtype)
+        prob_x = F.softmax(logits_x, dim=-1)
+        prob_y = F.softmax(logits_y, dim=-1)
+        off_x = (prob_x * x_bins).sum(dim=-1)
+        off_y = (prob_y * y_bins).sum(dim=-1)
+        return torch.stack((off_x, off_y), dim=-1)
+
+    @staticmethod
+    def _dpo_distribution_debug(logits_x: torch.Tensor, logits_y: torch.Tensor):
+        prob_x = F.softmax(logits_x.float(), dim=-1)
+        prob_y = F.softmax(logits_y.float(), dim=-1)
+        entropy_x = -(prob_x * prob_x.clamp_min(1e-12).log()).sum(dim=-1)
+        entropy_y = -(prob_y * prob_y.clamp_min(1e-12).log()).sum(dim=-1)
+        return {
+            'entropy_x': entropy_x,
+            'entropy_y': entropy_y,
+            'maxprob_x': prob_x.max(dim=-1).values,
+            'maxprob_y': prob_y.max(dim=-1).values,
+        }
+
+    def _predict_dpo_offsets(self, offset_feature, raw_offsets, dpo_x_head=None, dpo_y_head=None):
+        if not self.use_dpo_head or dpo_x_head is None or dpo_y_head is None:
+            return None, None, None, None, None
+        logits_x = dpo_x_head(offset_feature)
+        logits_y = dpo_y_head(offset_feature)
+        dpo_offsets = self._decode_dpo_offsets(logits_x, logits_y)
+        if self.dpo_blend_alpha is None:
+            blend_offsets = raw_offsets
+        else:
+            blend_offsets = raw_offsets + self.dpo_blend_alpha.to(dtype=raw_offsets.dtype, device=raw_offsets.device) * (
+                dpo_offsets.to(dtype=raw_offsets.dtype) - raw_offsets
+            )
+        debug = self._dpo_distribution_debug(logits_x, logits_y) if self.dpo_debug_fields else None
+        return logits_x, logits_y, dpo_offsets.to(dtype=raw_offsets.dtype), blend_offsets, debug
 
     @staticmethod
     def _init_cls_head_bias(head, bias):
@@ -1318,6 +1522,140 @@ class DFINETransformer(nn.Module):
         )
         return pooled.reshape(bs, query_count, feat.shape[1], size, size)
 
+    def _pool_multilevel_point_local_maps(
+        self,
+        proj_feats: List[torch.Tensor],
+        boxes_cxcywh: torch.Tensor,
+        output_size: int = None,
+        top_roi_params: tuple = None,
+    ) -> list:
+        """Pool TopROI maps from multiple feature levels for offset-only QDPT."""
+        size = self.qdpt_toproi_map_size if output_size is None else max(int(output_size), 2)
+        levels = self.qdpt_toproi_levels if self.qdpt_use_multilevel_toproi else [self.point_local_feature_level]
+        maps_by_level = []
+        for raw_level in levels:
+            level_idx = int(raw_level)
+            if level_idx >= len(proj_feats):
+                self._qdpt_runtime_warnings.add(
+                    f"qdpt_toproi_level_{level_idx}_missing_fallback_{min(self.point_local_feature_level, len(proj_feats) - 1)}"
+                )
+                level_idx = min(self.point_local_feature_level, len(proj_feats) - 1)
+            feat = proj_feats[level_idx]
+            bs, _, feat_h, feat_w = feat.shape
+            _, query_count, _ = boxes_cxcywh.shape
+            if query_count == 0:
+                maps = feat.new_zeros((bs, 0, feat.shape[1], size, size))
+            else:
+                rois_xyxy = self._build_point_top_rois(
+                    boxes_cxcywh,
+                    feat_h,
+                    feat_w,
+                    *(top_roi_params if top_roi_params is not None else (None, None, None)),
+                )
+                batch_ids = torch.arange(bs, device=feat.device, dtype=rois_xyxy.dtype).view(bs, 1, 1).expand(
+                    bs, query_count, 1
+                )
+                rois = torch.cat((batch_ids, rois_xyxy), dim=-1).reshape(-1, 5)
+                pooled = torchvision.ops.roi_align(
+                    feat,
+                    rois,
+                    output_size=(size, size),
+                    spatial_scale=1.0,
+                    aligned=True,
+                )
+                maps = pooled.reshape(bs, query_count, feat.shape[1], size, size)
+            maps_by_level.append((level_idx, maps))
+        return maps_by_level
+
+    def _tokenize_qdpt_toproi_maps(self, maps_by_level: list, dtype: torch.dtype) -> torch.Tensor:
+        tokens = []
+        for level_idx, maps in maps_by_level:
+            bs, query_count, channels, height, width = maps.shape
+            level_tokens = maps.flatten(3).permute(0, 1, 3, 2).to(dtype=dtype)
+            if self.qdpt_level_embed is not None:
+                level_id = torch.full((1,), int(level_idx), device=maps.device, dtype=torch.long)
+                level_embed = self.qdpt_level_embed(level_id).to(dtype=dtype).view(1, 1, 1, channels)
+                level_tokens = level_tokens + level_embed
+            tokens.append(level_tokens)
+        if not tokens:
+            raise RuntimeError("QDPT-Lite requires at least one TopROI token level")
+        return torch.cat(tokens, dim=2)
+
+    def _apply_qdpt_lite(
+        self,
+        hidden: torch.Tensor,
+        boxes_cxcywh: torch.Tensor,
+        proj_feats: List[torch.Tensor],
+        base_offsets: torch.Tensor,
+        query_pos_proj_head,
+        attn_head,
+        norm_head,
+        delta_head,
+        prior_head,
+        gate,
+        roi_boxes_cxcywh: torch.Tensor = None,
+        top_roi_params: tuple = None,
+    ):
+        if (
+            not self.use_qdpt_lite
+            or hidden is None
+            or boxes_cxcywh is None
+            or base_offsets is None
+            or query_pos_proj_head is None
+            or attn_head is None
+            or norm_head is None
+            or delta_head is None
+        ):
+            return base_offsets, None
+
+        local_boxes_cxcywh = boxes_cxcywh if roi_boxes_cxcywh is None else roi_boxes_cxcywh
+        maps_by_level = self._pool_multilevel_point_local_maps(
+            proj_feats,
+            local_boxes_cxcywh,
+            output_size=self.qdpt_toproi_map_size,
+            top_roi_params=top_roi_params,
+        )
+        local_tokens = self._tokenize_qdpt_toproi_maps(maps_by_level, hidden.dtype)
+        query_pos = self.query_pos_head(boxes_cxcywh).to(dtype=hidden.dtype)
+        point_token_base = hidden + query_pos_proj_head(query_pos)
+        bs, query_count, channels = point_token_base.shape
+        if query_count == 0:
+            qdpt_delta = base_offsets.new_zeros(base_offsets.shape)
+            prior_offset = base_offsets.new_zeros(base_offsets.shape)
+            gate_value = gate.to(dtype=base_offsets.dtype) if torch.is_tensor(gate) else base_offsets.new_tensor(float(gate))
+            final_offsets = base_offsets + gate_value * (prior_offset + qdpt_delta)
+            debug = {
+                "base": base_offsets,
+                "delta": qdpt_delta,
+                "prior": prior_offset,
+                "gate": gate_value.reshape(1),
+                "point_token_norm": base_offsets.new_zeros((*base_offsets.shape[:2], 1)),
+            }
+            return final_offsets, debug
+
+        attn_query = point_token_base.reshape(bs * query_count, 1, channels)
+        attn_tokens = local_tokens.reshape(bs * query_count, local_tokens.shape[2], channels)
+        token_update, _ = attn_head(attn_query, attn_tokens, attn_tokens, need_weights=False)
+        point_token = norm_head(point_token_base + token_update.reshape(bs, query_count, channels))
+        qdpt_delta = delta_head(point_token)
+        prior_offset = (
+            prior_head(self._box_geometry_features(boxes_cxcywh)).to(dtype=base_offsets.dtype)
+            if self.qdpt_use_point_prior and prior_head is not None
+            else torch.zeros_like(base_offsets)
+        )
+        gate_value = gate.to(device=base_offsets.device, dtype=base_offsets.dtype)
+        correction = prior_offset + qdpt_delta if self.qdpt_prior_residual else qdpt_delta
+        final_offsets = base_offsets + gate_value * correction
+        final_offsets = self._activate_point_offsets(final_offsets)
+        debug = {
+            "base": base_offsets,
+            "delta": qdpt_delta,
+            "prior": prior_offset,
+            "gate": gate_value.reshape(1),
+            "point_token_norm": point_token.norm(dim=-1, keepdim=True),
+        }
+        return final_offsets, debug
+
     def _predict_toproi_heatmap(
         self,
         proj_feats: List[torch.Tensor],
@@ -1417,6 +1755,14 @@ class DFINETransformer(nn.Module):
         query_pos_proj_head,
         box_geom_proj_head,
         fusion_head,
+        qdpt_query_pos_proj_head=None,
+        qdpt_attn_head=None,
+        qdpt_norm_head=None,
+        qdpt_delta_head=None,
+        qdpt_prior_head=None,
+        qdpt_gate=None,
+        dpo_x_head=None,
+        dpo_y_head=None,
         roi_boxes_cxcywh: torch.Tensor = None,
     ):
         """Predict per-query has_picking logits, point offsets, and optional point reliability."""
@@ -1459,7 +1805,31 @@ class DFINETransformer(nn.Module):
         else:
             offset_feature = cls_feature
         has_logits = cls_head(cls_feature)
-        picking_offsets = self._activate_point_offsets(offset_head(offset_feature))
+        base_picking_offsets = self._activate_point_offsets(offset_head(offset_feature))
+        picking_offsets, qdpt_debug = self._apply_qdpt_lite(
+            offset_feature,
+            boxes_cxcywh,
+            proj_feats,
+            base_picking_offsets,
+            qdpt_query_pos_proj_head,
+            qdpt_attn_head,
+            qdpt_norm_head,
+            qdpt_delta_head,
+            qdpt_prior_head,
+            qdpt_gate,
+            roi_boxes_cxcywh=roi_boxes_cxcywh,
+            top_roi_params=(
+                self.point_offset_top_local_width_scale,
+                self.point_offset_top_local_y_min_ratio,
+                self.point_offset_top_local_y_max_ratio,
+            ) if self.point_decoupled_roi else None,
+        )
+        dpo_x_logits, dpo_y_logits, dpo_offsets, dpo_blend_offsets, dpo_debug = self._predict_dpo_offsets(
+            offset_feature,
+            picking_offsets,
+            dpo_x_head,
+            dpo_y_head,
+        )
         if quality_head is not None:
             # v7_exp2_point_quality_sg uses the same quality target as the
             # original point_quality ablation, but stops quality-loss gradients
@@ -1543,6 +1913,12 @@ class DFINETransformer(nn.Module):
             simcc_x_logits,
             simcc_y_logits,
             heatmap_logits,
+            qdpt_debug,
+            dpo_x_logits,
+            dpo_y_logits,
+            dpo_offsets,
+            dpo_blend_offsets,
+            dpo_debug,
         )
 
     def _predict_grouped_picking_offsets(
@@ -1678,6 +2054,20 @@ class DFINETransformer(nn.Module):
                 self._init_reg_head_zero(head)
         if self.dec_grouped_offset_head is not None:
             for head in self.dec_grouped_offset_head:
+                self._init_reg_head_zero(head)
+        if self.qdpt_level_embed is not None:
+            init.normal_(self.qdpt_level_embed.weight, std=0.02)
+        if self.pre_qdpt_query_pos_proj is not None:
+            init.xavier_uniform_(self.pre_qdpt_query_pos_proj.weight)
+            init.constant_(self.pre_qdpt_query_pos_proj.bias, 0)
+        if self.dec_qdpt_query_pos_proj is not None:
+            for head in self.dec_qdpt_query_pos_proj:
+                init.xavier_uniform_(head.weight)
+                init.constant_(head.bias, 0)
+        if self.pre_qdpt_prior_head is not None:
+            self._init_reg_head_zero(self.pre_qdpt_prior_head)
+        if self.dec_qdpt_prior_head is not None:
+            for head in self.dec_qdpt_prior_head:
                 self._init_reg_head_zero(head)
         init.xavier_uniform_(self.enc_output[0].weight)
         if self.learn_query_content:
@@ -1907,7 +2297,7 @@ class DFINETransformer(nn.Module):
             dn_out_hidden = None
 
         if self.use_picking_point_head:
-            pre_picking_logits, pre_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_point_reliability_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits = self._predict_point_branch(
+            pre_picking_logits, pre_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_point_reliability_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits, pre_qdpt_debug, pre_dpo_x_logits, pre_dpo_y_logits, pre_dpo_offsets, pre_dpo_blend_offsets, pre_dpo_debug = self._predict_point_branch(
                 pre_hidden,
                 pre_bboxes,
                 pre_logits,
@@ -1929,6 +2319,14 @@ class DFINETransformer(nn.Module):
                 self.pre_point_query_pos_proj,
                 self.pre_point_box_geom_proj,
                 self.pre_point_fusion_head,
+                self.pre_qdpt_query_pos_proj,
+                self.pre_qdpt_attn,
+                self.pre_qdpt_norm,
+                self.pre_qdpt_delta_head,
+                self.pre_qdpt_prior_head,
+                self.pre_qdpt_gate,
+                self.pre_dpo_x_head,
+                self.pre_dpo_y_head,
             )
             pre_grouped_picking_offsets = self._predict_grouped_picking_offsets(
                 pre_hidden,
@@ -1952,12 +2350,18 @@ class DFINETransformer(nn.Module):
             out_toproi_simcc_x_logits_list = []
             out_toproi_simcc_y_logits_list = []
             out_toproi_heatmap_logits_list = []
+            out_dpo_x_logits_list = []
+            out_dpo_y_logits_list = []
+            out_dpo_offsets_list = []
+            out_dpo_blend_offsets_list = []
+            final_qdpt_debug = None
+            final_dpo_debug = None
             final_decoder_layer_idx = out_hidden.shape[0] - 1
             for layer_idx in range(out_hidden.shape[0]):
                 heatmap_head_i = None
                 if self.dec_toproi_heatmap_head is not None and layer_idx == final_decoder_layer_idx:
                     heatmap_head_i = self.dec_toproi_heatmap_head[layer_idx]
-                logits_i, offsets_i, quality_i, selector_i, accept_i, reliability_i, weak_heatmap_i, simcc_x_i, simcc_y_i, heatmap_i = self._predict_point_branch(
+                logits_i, offsets_i, quality_i, selector_i, accept_i, reliability_i, weak_heatmap_i, simcc_x_i, simcc_y_i, heatmap_i, qdpt_debug_i, dpo_x_i, dpo_y_i, dpo_offsets_i, dpo_blend_offsets_i, dpo_debug_i = self._predict_point_branch(
                     out_hidden[layer_idx],
                     out_bboxes[layer_idx],
                     out_logits[layer_idx],
@@ -1979,6 +2383,14 @@ class DFINETransformer(nn.Module):
                     self.dec_point_query_pos_proj[layer_idx] if self.dec_point_query_pos_proj is not None else None,
                     self.dec_point_box_geom_proj[layer_idx] if self.dec_point_box_geom_proj is not None else None,
                     self.dec_point_fusion_head[layer_idx] if self.dec_point_fusion_head is not None else None,
+                    self.dec_qdpt_query_pos_proj[layer_idx] if self.dec_qdpt_query_pos_proj is not None else None,
+                    self.dec_qdpt_attn[layer_idx] if self.dec_qdpt_attn is not None else None,
+                    self.dec_qdpt_norm[layer_idx] if self.dec_qdpt_norm is not None else None,
+                    self.dec_qdpt_delta_head[layer_idx] if self.dec_qdpt_delta_head is not None else None,
+                    self.dec_qdpt_prior_head[layer_idx] if self.dec_qdpt_prior_head is not None else None,
+                    self.dec_qdpt_gate[layer_idx] if self.dec_qdpt_gate is not None else None,
+                    self.dec_dpo_x_head[layer_idx] if self.dec_dpo_x_head is not None else None,
+                    self.dec_dpo_y_head[layer_idx] if self.dec_dpo_y_head is not None else None,
                 )
                 grouped_offsets_i = self._predict_grouped_picking_offsets(
                     out_hidden[layer_idx],
@@ -2010,6 +2422,14 @@ class DFINETransformer(nn.Module):
                     out_toproi_simcc_y_logits_list.append(simcc_y_i)
                 if heatmap_i is not None:
                     out_toproi_heatmap_logits_list.append(heatmap_i)
+                if dpo_x_i is not None and dpo_y_i is not None:
+                    out_dpo_x_logits_list.append(dpo_x_i)
+                    out_dpo_y_logits_list.append(dpo_y_i)
+                    out_dpo_offsets_list.append(dpo_offsets_i)
+                    out_dpo_blend_offsets_list.append(dpo_blend_offsets_i)
+                if layer_idx == final_decoder_layer_idx:
+                    final_qdpt_debug = qdpt_debug_i
+                    final_dpo_debug = dpo_debug_i
             out_picking_logits = torch.stack(out_picking_logits_list) if out_picking_logits_list else None
             out_picking_offsets = torch.stack(out_picking_offsets_list) if out_picking_offsets_list else None
             out_grouped_picking_offsets = torch.stack(out_grouped_picking_offsets_list) if out_grouped_picking_offsets_list else None
@@ -2021,6 +2441,10 @@ class DFINETransformer(nn.Module):
             out_toproi_simcc_x_logits = torch.stack(out_toproi_simcc_x_logits_list) if out_toproi_simcc_x_logits_list else None
             out_toproi_simcc_y_logits = torch.stack(out_toproi_simcc_y_logits_list) if out_toproi_simcc_y_logits_list else None
             out_toproi_heatmap_logits = torch.stack(out_toproi_heatmap_logits_list) if out_toproi_heatmap_logits_list else None
+            out_dpo_x_logits = torch.stack(out_dpo_x_logits_list) if out_dpo_x_logits_list else None
+            out_dpo_y_logits = torch.stack(out_dpo_y_logits_list) if out_dpo_y_logits_list else None
+            out_dpo_offsets = torch.stack(out_dpo_offsets_list) if out_dpo_offsets_list else None
+            out_dpo_blend_offsets = torch.stack(out_dpo_blend_offsets_list) if out_dpo_blend_offsets_list else None
 
             if dn_out_hidden is not None:
                 dn_out_picking_logits_list = []
@@ -2035,7 +2459,7 @@ class DFINETransformer(nn.Module):
                 dn_out_toproi_simcc_y_logits_list = []
                 dn_out_toproi_heatmap_logits_list = []
                 for layer_idx in range(dn_out_hidden.shape[0]):
-                    logits_i, offsets_i, quality_i, selector_i, accept_i, reliability_i, weak_heatmap_i, simcc_x_i, simcc_y_i, heatmap_i = self._predict_point_branch(
+                    logits_i, offsets_i, quality_i, selector_i, accept_i, reliability_i, weak_heatmap_i, simcc_x_i, simcc_y_i, heatmap_i, _, _, _, _, _, _ = self._predict_point_branch(
                         dn_out_hidden[layer_idx],
                         dn_out_bboxes[layer_idx],
                         dn_out_logits[layer_idx],
@@ -2057,6 +2481,14 @@ class DFINETransformer(nn.Module):
                         self.dec_point_query_pos_proj[layer_idx] if self.dec_point_query_pos_proj is not None else None,
                         self.dec_point_box_geom_proj[layer_idx] if self.dec_point_box_geom_proj is not None else None,
                         self.dec_point_fusion_head[layer_idx] if self.dec_point_fusion_head is not None else None,
+                        self.dec_qdpt_query_pos_proj[layer_idx] if self.dec_qdpt_query_pos_proj is not None else None,
+                        self.dec_qdpt_attn[layer_idx] if self.dec_qdpt_attn is not None else None,
+                        self.dec_qdpt_norm[layer_idx] if self.dec_qdpt_norm is not None else None,
+                        self.dec_qdpt_delta_head[layer_idx] if self.dec_qdpt_delta_head is not None else None,
+                        self.dec_qdpt_prior_head[layer_idx] if self.dec_qdpt_prior_head is not None else None,
+                        self.dec_qdpt_gate[layer_idx] if self.dec_qdpt_gate is not None else None,
+                        None,
+                        None,
                         roi_boxes_cxcywh=dn_teacher_roi_boxes,
                     )
                     grouped_offsets_i = self._predict_grouped_picking_offsets(
@@ -2105,7 +2537,7 @@ class DFINETransformer(nn.Module):
                 dn_out_picking_logits, dn_out_picking_offsets, dn_out_grouped_picking_offsets, dn_out_point_quality_logits, dn_out_point_selector_logits, dn_out_point_accept_logits, dn_out_point_reliability_logits, dn_out_weak_heatmap_logits, dn_out_toproi_simcc_x_logits, dn_out_toproi_simcc_y_logits, dn_out_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
 
             if dn_pre_hidden is not None:
-                dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_point_reliability_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits = self._predict_point_branch(
+                dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_point_reliability_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits, _, _, _, _, _, _ = self._predict_point_branch(
                     dn_pre_hidden,
                     dn_pre_bboxes,
                     dn_pre_logits,
@@ -2127,6 +2559,14 @@ class DFINETransformer(nn.Module):
                     self.pre_point_query_pos_proj,
                     self.pre_point_box_geom_proj,
                     self.pre_point_fusion_head,
+                    self.pre_qdpt_query_pos_proj,
+                    self.pre_qdpt_attn,
+                    self.pre_qdpt_norm,
+                    self.pre_qdpt_delta_head,
+                    self.pre_qdpt_prior_head,
+                    self.pre_qdpt_gate,
+                    None,
+                    None,
                     roi_boxes_cxcywh=dn_teacher_roi_boxes,
                 )
                 dn_pre_grouped_picking_offsets = self._predict_grouped_picking_offsets(
@@ -2154,6 +2594,11 @@ class DFINETransformer(nn.Module):
             out_toproi_simcc_x_logits = None
             out_toproi_simcc_y_logits = None
             out_toproi_heatmap_logits = None
+            out_dpo_x_logits = None
+            out_dpo_y_logits = None
+            out_dpo_offsets = None
+            out_dpo_blend_offsets = None
+            final_dpo_debug = None
             dn_out_picking_logits, dn_out_picking_offsets, dn_out_grouped_picking_offsets, dn_out_point_quality_logits, dn_out_point_selector_logits, dn_out_point_accept_logits, dn_out_point_reliability_logits, dn_out_weak_heatmap_logits, dn_out_toproi_simcc_x_logits, dn_out_toproi_simcc_y_logits, dn_out_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
             pre_picking_logits, pre_picking_offsets, pre_grouped_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_point_reliability_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
             dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_grouped_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_point_reliability_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
@@ -2185,6 +2630,24 @@ class DFINETransformer(nn.Module):
                 out['pred_toproi_simcc_y'] = out_toproi_simcc_y_logits[-1]
             if out_toproi_heatmap_logits is not None:
                 out['pred_toproi_heatmap'] = out_toproi_heatmap_logits[-1]
+            if self.use_qdpt_lite and self.qdpt_debug_fields and final_qdpt_debug is not None:
+                out['pred_picking_offsets_base'] = final_qdpt_debug['base']
+                out['pred_picking_offsets_qdpt_delta'] = final_qdpt_debug['delta']
+                out['pred_picking_offsets_prior'] = final_qdpt_debug['prior']
+                out['qdpt_gate'] = final_qdpt_debug['gate']
+                out['qdpt_point_token_norm'] = final_qdpt_debug['point_token_norm']
+            if out_dpo_x_logits is not None and out_dpo_y_logits is not None:
+                out['pred_dpo_logits_x'] = out_dpo_x_logits[-1]
+                out['pred_dpo_logits_y'] = out_dpo_y_logits[-1]
+                out['pred_dpo_offsets'] = out_dpo_offsets[-1]
+                out['pred_dpo_blend_offsets'] = out_dpo_blend_offsets[-1]
+                if self.dpo_blend_alpha is not None:
+                    out['dpo_blend_alpha'] = self.dpo_blend_alpha.reshape(1)
+                if self.dpo_debug_fields and final_dpo_debug is not None:
+                    out['dpo_entropy_x'] = final_dpo_debug['entropy_x']
+                    out['dpo_entropy_y'] = final_dpo_debug['entropy_y']
+                    out['dpo_maxprob_x'] = final_dpo_debug['maxprob_x']
+                    out['dpo_maxprob_y'] = final_dpo_debug['maxprob_y']
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss2(
