@@ -1,0 +1,59 @@
+__include__: [
+  ./rtv4_hgnetv2_s_grape_point_enc_ema_bifpn_weighted_fusion.yml
+]
+
+output_dir: ./outputs/01_mainline_results/candidate_cada_v1/ema_bifpn_cada_v1_adapter_only_probe20
+use_ema: false
+epoches: 20
+checkpoint_freq: 2
+print_freq: 50
+
+trainable_keywords:
+  - cada
+
+optimizer:
+  type: AdamW
+  params:
+    - params: cada
+      lr: 0.0001
+      weight_decay: 0.0001
+  lr: 0.0001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+lr_scheduler:
+  type: MultiStepLR
+  milestones: [500]
+  gamma: 0.1
+
+lr_warmup_scheduler:
+  type: LinearWarmup
+  warmup_duration: 200
+
+HybridEncoder:
+  use_cada: true
+  cada_insert_position: encoder_output
+  cada_levels: [0, 1, 2]
+  cada_channels: 256
+  cada_use_local_conv: true
+  cada_use_channel_attn: true
+  cada_use_spatial_attn: true
+  cada_use_cross_scale: true
+  cada_norm: gn
+  cada_activation: silu
+  cada_gate_init: 0.001
+  cada_debug: true
+
+DFINETransformer:
+  use_c2f_ccr: false
+  use_toproi_simcc_refiner: false
+  use_toproi_heatmap_refiner: false
+  use_grouped_picking_query: false
+  use_qdpt_lite: false
+  use_dpo_head: false
+  use_hrpb: false
+  use_point_quality_head: false
+  use_point_selector_head: false
+  use_point_accept_head: false
+  use_point_reliability_head: false
+  use_weak_point_heatmap_head: false

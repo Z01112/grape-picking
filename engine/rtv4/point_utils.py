@@ -131,6 +131,111 @@ def normalized_offsets_from_boxes_and_points(
     return (points_xy - centers) / sizes
 
 
+def top_roi_local_from_boxes_and_offsets(
+    boxes_cxcywh: torch.Tensor,
+    offsets_xy: torch.Tensor,
+    offset_mode: str = "top_center",
+    top_anchor_ratio: float = 0.12,
+    anchor_x_ratio: float = 0.5,
+    roi_width_scale: float = 1.08,
+    roi_y_min_ratio: float = -0.10,
+    roi_y_max_ratio: float = 0.40,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map bbox-normalized point offsets into TopROI local coordinates.
+
+    The returned local coordinates are in the unclamped TopROI coordinate
+    system used by the point branch.  A boolean mask marks points inside
+    [0, 1] x [0, 1].  This helper is pure geometry and does not depend on
+    detector scores, matching cost, or postprocessing.
+    """
+    boxes_cxcywh = boxes_cxcywh.to(torch.float32)
+    offsets_xy = offsets_xy.to(torch.float32)
+    points = absolute_points_from_boxes_and_offsets(
+        boxes_cxcywh,
+        offsets_xy,
+        mode=offset_mode,
+        top_anchor_ratio=top_anchor_ratio,
+        anchor_x_ratio=anchor_x_ratio,
+    )
+    cx, cy, w, h = boxes_cxcywh.unbind(-1)
+    w = w.clamp(min=1e-6)
+    h = h.clamp(min=1e-6)
+    roi_w = (w * float(roi_width_scale)).clamp(min=1e-6)
+    box_top = cy - 0.5 * h
+    roi_x1 = cx - 0.5 * roi_w
+    roi_y1 = box_top + float(roi_y_min_ratio) * h
+    roi_h = (float(roi_y_max_ratio) - float(roi_y_min_ratio)) * h
+    roi_h = roi_h.clamp(min=1e-6)
+    local_x = (points[..., 0] - roi_x1) / roi_w
+    local_y = (points[..., 1] - roi_y1) / roi_h
+    local = torch.stack((local_x, local_y), dim=-1)
+    in_roi = (
+        torch.isfinite(local).all(dim=-1)
+        & (local[..., 0] >= 0.0)
+        & (local[..., 0] <= 1.0)
+        & (local[..., 1] >= 0.0)
+        & (local[..., 1] <= 1.0)
+    )
+    return local, in_roi
+
+
+def top_roi_local_from_boxes_and_points(
+    boxes_cxcywh: torch.Tensor,
+    points_xy: torch.Tensor,
+    roi_width_scale: float = 1.08,
+    roi_y_min_ratio: float = -0.10,
+    roi_y_max_ratio: float = 0.40,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map absolute point coordinates into a query box TopROI."""
+    boxes_cxcywh = boxes_cxcywh.to(torch.float32)
+    points_xy = points_xy.to(torch.float32)
+    cx, cy, w, h = boxes_cxcywh.unbind(-1)
+    w = w.clamp(min=1e-6)
+    h = h.clamp(min=1e-6)
+    roi_w = (w * float(roi_width_scale)).clamp(min=1e-6)
+    box_top = cy - 0.5 * h
+    roi_x1 = cx - 0.5 * roi_w
+    roi_y1 = box_top + float(roi_y_min_ratio) * h
+    roi_h = (float(roi_y_max_ratio) - float(roi_y_min_ratio)) * h
+    roi_h = roi_h.clamp(min=1e-6)
+    local_x = (points_xy[..., 0] - roi_x1) / roi_w
+    local_y = (points_xy[..., 1] - roi_y1) / roi_h
+    local = torch.stack((local_x, local_y), dim=-1)
+    in_roi = (
+        torch.isfinite(local).all(dim=-1)
+        & (local[..., 0] >= 0.0)
+        & (local[..., 0] <= 1.0)
+        & (local[..., 1] >= 0.0)
+        & (local[..., 1] <= 1.0)
+    )
+    return local, in_roi
+
+
+def top_roi_offsets_from_local_delta(
+    boxes_cxcywh: torch.Tensor,
+    local_delta_xy: torch.Tensor,
+    roi_width_scale: float = 1.08,
+    roi_y_min_ratio: float = -0.10,
+    roi_y_max_ratio: float = 0.40,
+) -> torch.Tensor:
+    """Convert a TopROI-local delta into bbox-normalized offset delta."""
+    boxes_cxcywh = boxes_cxcywh.to(torch.float32)
+    local_delta_xy = local_delta_xy.to(torch.float32)
+    _, _, w, h = boxes_cxcywh.unbind(-1)
+    w = w.clamp(min=1e-6)
+    h = h.clamp(min=1e-6)
+    roi_w_over_box_w = float(roi_width_scale)
+    roi_h_over_box_h = float(roi_y_max_ratio) - float(roi_y_min_ratio)
+    scale = torch.stack(
+        (
+            local_delta_xy.new_full(w.shape, roi_w_over_box_w),
+            local_delta_xy.new_full(h.shape, roi_h_over_box_h),
+        ),
+        dim=-1,
+    )
+    return local_delta_xy * scale
+
+
 def assert_offset_roundtrip(
     boxes_cxcywh: torch.Tensor,
     offsets_xy: torch.Tensor,

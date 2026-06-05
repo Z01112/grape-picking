@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .utils import get_activation
+from .cada_adapter import CADAAdapter
 
 from ..core import register
 
@@ -359,6 +360,18 @@ class HybridEncoder(nn.Module):
                  ema_groups=8,
                  weighted_fusion_mode=None,
                  weighted_fusion_eps=1e-4,
+                 use_cada=False,
+                 cada_insert_position='encoder_output',
+                 cada_levels=[0, 1, 2],
+                 cada_channels=256,
+                 cada_use_local_conv=True,
+                 cada_use_channel_attn=True,
+                 cada_use_spatial_attn=True,
+                 cada_use_cross_scale=True,
+                 cada_norm='gn',
+                 cada_activation='silu',
+                 cada_gate_init=0.0,
+                 cada_debug=False,
                  ):
         super().__init__()
         self.in_channels = in_channels
@@ -372,6 +385,9 @@ class HybridEncoder(nn.Module):
         self.ema_groups = ema_groups
         self.weighted_fusion_mode = weighted_fusion_mode
         self.weighted_fusion_eps = weighted_fusion_eps
+        self.use_cada = bool(use_cada)
+        self.cada_insert_position = cada_insert_position
+        self.cada_debug = bool(cada_debug)
 
         self.out_channels = [hidden_dim for _ in range(len(in_channels))]
         self.out_strides = feat_strides
@@ -464,6 +480,25 @@ class HybridEncoder(nn.Module):
         else:
             raise ValueError(f"Unsupported ema_mode: {ema_mode}")
 
+        self.cada_adapter = None
+        if self.use_cada:
+            if cada_insert_position != 'encoder_output':
+                raise ValueError(f"Unsupported cada_insert_position: {cada_insert_position}")
+            if int(cada_channels) != int(hidden_dim):
+                raise ValueError(f"CADA channels ({cada_channels}) must match HybridEncoder hidden_dim ({hidden_dim})")
+            self.cada_adapter = CADAAdapter(
+                num_levels=len(in_channels),
+                channels=hidden_dim,
+                levels=cada_levels,
+                use_local_conv=cada_use_local_conv,
+                use_channel_attn=cada_use_channel_attn,
+                use_spatial_attn=cada_use_spatial_attn,
+                use_cross_scale=cada_use_cross_scale,
+                norm=cada_norm,
+                activation=cada_activation,
+                gate_init=cada_gate_init,
+            )
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -494,7 +529,7 @@ class HybridEncoder(nn.Module):
 
         return torch.concat([out_w.sin(), out_w.cos(), out_h.sin(), out_h.cos()], dim=1)[None, :, :]
 
-    def forward(self, feats):
+    def forward(self, feats, return_cada_debug: bool = False):
         assert len(feats) == len(self.in_channels)
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
 
@@ -554,6 +589,17 @@ class HybridEncoder(nn.Module):
         if self.ema_fusion is not None:
             outs = [attn(feat) for attn, feat in zip(self.ema_fusion, outs)]
 
+        cada_debug = None
+        if self.cada_adapter is not None:
+            if return_cada_debug:
+                outs, cada_debug = self.cada_adapter(outs, return_debug=True)
+            else:
+                outs = self.cada_adapter(outs)
+
+        if return_cada_debug:
+            if self.training and distill_student_output is not None:
+                return (outs, distill_student_output), cada_debug
+            return outs, cada_debug
         if self.training and distill_student_output is not None:
             return outs, distill_student_output
         return outs

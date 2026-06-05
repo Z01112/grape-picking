@@ -22,6 +22,7 @@ from .dfine_utils import weighting_function, distance2bbox
 from .denoising import get_contrastive_denoising_training_group
 from .utils import deformable_attention_core_func_v2, get_activation, inverse_sigmoid
 from .utils import bias_init_with_prob
+from .point_utils import top_roi_local_from_boxes_and_offsets, top_roi_offsets_from_local_delta
 from ..core import register
 
 __all__ = ['DFINETransformer']
@@ -534,6 +535,22 @@ class DFINETransformer(nn.Module):
                  dpo_inference_mode='raw_offset',
                  dpo_blend_init=0.0,
                  dpo_debug_fields=True,
+                 use_hrpb=False,
+                 point_hr_levels=('P2', 'P3'),
+                 point_hr_roi_size=5,
+                 point_hr_channels=128,
+                 point_hr_gate_init=0.0,
+                 point_hr_use_p2=True,
+                 point_hr_use_p3=True,
+                 point_hr_debug=True,
+                 use_c2f_ccr=False,
+                 c2f_grid_size=7,
+                 c2f_roi_size=5,
+                 c2f_hidden_dim=256,
+                 c2f_gate_init=0.0,
+                 c2f_use_toproi_map=True,
+                 c2f_residual_tanh=True,
+                 c2f_debug=True,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -666,6 +683,38 @@ class DFINETransformer(nn.Module):
         if self.dpo_inference_mode not in ('raw_offset', 'dpo_expectation', 'blend'):
             raise ValueError(f"Unsupported dpo_inference_mode: {dpo_inference_mode}")
         self.dpo_debug_fields = bool(dpo_debug_fields)
+        self.use_hrpb = bool(use_hrpb)
+        self.point_hr_roi_size = max(int(point_hr_roi_size), 2)
+        self.point_hr_channels = max(int(point_hr_channels), 8)
+        self.point_hr_gate_init = float(point_hr_gate_init)
+        self.point_hr_use_p2 = bool(point_hr_use_p2)
+        self.point_hr_use_p3 = bool(point_hr_use_p3)
+        self.point_hr_debug = bool(point_hr_debug)
+        self.use_c2f_ccr = bool(use_c2f_ccr)
+        self.c2f_grid_size = max(int(c2f_grid_size), 2)
+        self.c2f_roi_size = max(int(c2f_roi_size), 2)
+        self.c2f_hidden_dim = max(int(c2f_hidden_dim), 8)
+        self.c2f_gate_init = float(c2f_gate_init)
+        self.c2f_use_toproi_map = bool(c2f_use_toproi_map)
+        self.c2f_residual_tanh = bool(c2f_residual_tanh)
+        self.c2f_debug = bool(c2f_debug)
+        if isinstance(point_hr_levels, str):
+            point_hr_levels = [item.strip() for item in point_hr_levels.split(',') if item.strip()]
+        self.point_hr_levels = [str(level).strip().upper() for level in point_hr_levels]
+        self.point_hr_level_indices = []
+        self.point_hr_unavailable_levels = []
+        for level in self.point_hr_levels:
+            if level == 'P2':
+                self.point_hr_unavailable_levels.append(level)
+            elif level == 'P3' and self.point_hr_use_p3:
+                self.point_hr_level_indices.append(0)
+            elif level == 'P4':
+                self.point_hr_level_indices.append(1)
+            elif level == 'P5':
+                self.point_hr_level_indices.append(2)
+        self.point_hr_level_indices = sorted(set(self.point_hr_level_indices))
+        self._hrpb_runtime_warnings = set()
+        self._hrpb_last_feature_shapes = []
         # GPPoint-DETR keeps the detector queries intact and changes only how
         # the per-query point feature is enriched before has/offset prediction.
         self.point_legacy_local_feature = self.point_instance_binding_mode == 'legacy' and self.point_local_feature_fusion
@@ -785,6 +834,13 @@ class DFINETransformer(nn.Module):
         self.pre_dpo_x_head = None
         self.pre_dpo_y_head = None
         self.dpo_blend_alpha = None
+        self.point_hr_tower = None
+        self.point_hr_delta_head = None
+        self.point_hr_gate = None
+        self.c2f_roi_encoder = None
+        self.c2f_grid_head = None
+        self.c2f_residual_head = None
+        self.c2f_gate = None
         if self.use_picking_point_head:
             # Per-grape-query picking heads: has_picking classifies whether the
             # matched grape has a visible picking point, while point_offset
@@ -1197,6 +1253,37 @@ class DFINETransformer(nn.Module):
                     ]
                 )
                 self.dpo_blend_alpha = nn.Parameter(torch.tensor(float(dpo_blend_init), dtype=torch.float32))
+            if self.use_hrpb:
+                norm_groups = 8 if self.point_hr_channels % 8 == 0 else 1
+                self.point_hr_tower = nn.Sequential(
+                    nn.Conv2d(hidden_dim, self.point_hr_channels, 3, padding=1, bias=False),
+                    nn.GroupNorm(norm_groups, self.point_hr_channels),
+                    get_activation(mlp_act),
+                    nn.Conv2d(self.point_hr_channels, self.point_hr_channels, 3, padding=1, bias=False),
+                    nn.GroupNorm(norm_groups, self.point_hr_channels),
+                    get_activation(mlp_act),
+                )
+                self.point_hr_delta_head = self._make_point_head(
+                    self.point_hr_channels,
+                    self.point_hr_channels,
+                    2,
+                    2,
+                    mlp_act,
+                )
+                self.point_hr_gate = nn.Parameter(torch.tensor(self.point_hr_gate_init, dtype=torch.float32))
+            if self.use_c2f_ccr:
+                norm_groups = 8 if self.c2f_hidden_dim % 8 == 0 else 1
+                self.c2f_roi_encoder = nn.Sequential(
+                    nn.Conv2d(hidden_dim, self.c2f_hidden_dim, 3, padding=1, bias=False),
+                    nn.GroupNorm(norm_groups, self.c2f_hidden_dim),
+                    get_activation(mlp_act),
+                    nn.Conv2d(self.c2f_hidden_dim, self.c2f_hidden_dim, 3, padding=1, bias=False),
+                    nn.GroupNorm(norm_groups, self.c2f_hidden_dim),
+                    get_activation(mlp_act),
+                )
+                self.c2f_grid_head = nn.Conv2d(self.c2f_hidden_dim, 1, 1)
+                self.c2f_residual_head = nn.Conv2d(self.c2f_hidden_dim, 2, 1)
+                self.c2f_gate = nn.Parameter(torch.tensor(self.c2f_gate_init, dtype=torch.float32))
         self.pre_bbox_head = MLP(hidden_dim, hidden_dim, 4, 3, act=mlp_act)
         self.dec_bbox_head = nn.ModuleList(
             [MLP(hidden_dim, hidden_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(self.eval_idx + 1)]
@@ -1339,6 +1426,167 @@ class DFINETransformer(nn.Module):
             )
         debug = self._dpo_distribution_debug(logits_x, logits_y) if self.dpo_debug_fields else None
         return logits_x, logits_y, dpo_offsets.to(dtype=raw_offsets.dtype), blend_offsets, debug
+
+    def _pool_hrpb_roi_features(self, proj_feats: List[torch.Tensor], boxes_cxcywh: torch.Tensor):
+        if (
+            not self.use_hrpb
+            or self.point_hr_tower is None
+            or boxes_cxcywh is None
+            or not self.point_hr_level_indices
+        ):
+            return None
+        bs, query_count, _ = boxes_cxcywh.shape
+        pooled_features = []
+        shape_rows = []
+        if 'P2' in self.point_hr_unavailable_levels:
+            self._hrpb_runtime_warnings.add(
+                'P2 unavailable: current HGNetv2 return_idx exposes only P3/P4/P5 to RTv4.'
+            )
+        for level_idx in self.point_hr_level_indices:
+            if level_idx >= len(proj_feats):
+                self._hrpb_runtime_warnings.add(f'HRPB requested feature index {level_idx} but only {len(proj_feats)} levels exist.')
+                continue
+            feat = proj_feats[level_idx]
+            _, channels, feat_h, feat_w = feat.shape
+            if query_count == 0:
+                maps = feat.new_zeros((bs, 0, channels, self.point_hr_roi_size, self.point_hr_roi_size))
+            else:
+                rois_xyxy = self._build_point_top_rois(
+                    boxes_cxcywh,
+                    feat_h,
+                    feat_w,
+                    self.point_offset_top_local_width_scale,
+                    self.point_offset_top_local_y_min_ratio,
+                    self.point_offset_top_local_y_max_ratio,
+                )
+                batch_ids = torch.arange(bs, device=feat.device, dtype=rois_xyxy.dtype).view(bs, 1, 1).expand(
+                    bs, query_count, 1
+                )
+                rois = torch.cat((batch_ids, rois_xyxy), dim=-1).reshape(-1, 5)
+                pooled = torchvision.ops.roi_align(
+                    feat,
+                    rois,
+                    output_size=(self.point_hr_roi_size, self.point_hr_roi_size),
+                    spatial_scale=1.0,
+                    aligned=True,
+                )
+                maps = pooled.reshape(bs, query_count, channels, self.point_hr_roi_size, self.point_hr_roi_size)
+            tower_out = self.point_hr_tower(maps.reshape(bs * query_count, channels, self.point_hr_roi_size, self.point_hr_roi_size))
+            pooled = tower_out.mean(dim=(-1, -2)).reshape(bs, query_count, self.point_hr_channels)
+            pooled_features.append(pooled)
+            level_name = {0: 'P3', 1: 'P4', 2: 'P5'}.get(level_idx, f'idx{level_idx}')
+            shape_rows.append(
+                {
+                    'level': level_name,
+                    'feature_index': int(level_idx),
+                    'stride': int(self.feat_strides[level_idx]) if level_idx < len(self.feat_strides) else None,
+                    'feature_shape': [int(v) for v in feat.shape],
+                    'roi_map_shape': [int(v) for v in maps.shape],
+                    'tower_output_shape': [int(v) for v in tower_out.shape],
+                }
+            )
+        self._hrpb_last_feature_shapes = shape_rows
+        if not pooled_features:
+            return None
+        return torch.stack(pooled_features, dim=0).mean(dim=0)
+
+    def _apply_hrpb_offsets(self, raw_offsets: torch.Tensor, boxes_cxcywh: torch.Tensor, proj_feats: List[torch.Tensor]):
+        if (
+            not self.use_hrpb
+            or raw_offsets is None
+            or boxes_cxcywh is None
+            or self.point_hr_delta_head is None
+            or self.point_hr_gate is None
+        ):
+            return raw_offsets, None
+        hr_feature = self._pool_hrpb_roi_features(proj_feats, boxes_cxcywh)
+        if hr_feature is None:
+            return raw_offsets, None
+        hr_delta = self.point_hr_delta_head(hr_feature).to(dtype=raw_offsets.dtype)
+        gate = self.point_hr_gate.to(device=raw_offsets.device, dtype=raw_offsets.dtype)
+        final_offsets = raw_offsets + gate * hr_delta
+        debug = {
+            'raw': raw_offsets,
+            'delta': hr_delta,
+            'gate': gate.reshape(1),
+            'feature_norm': hr_feature.norm(dim=-1, keepdim=True).to(dtype=raw_offsets.dtype),
+        }
+        return final_offsets, debug
+
+    def _c2f_cell_centers(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        grid = self.c2f_grid_size
+        coord = (torch.arange(grid, device=device, dtype=dtype) + 0.5) / float(grid)
+        yy, xx = torch.meshgrid(coord, coord, indexing='ij')
+        return torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=-1)
+
+    def _apply_c2f_ccr_offsets(self, raw_offsets: torch.Tensor, boxes_cxcywh: torch.Tensor, proj_feats: List[torch.Tensor]):
+        if (
+            not self.use_c2f_ccr
+            or raw_offsets is None
+            or boxes_cxcywh is None
+            or self.c2f_roi_encoder is None
+            or self.c2f_grid_head is None
+            or self.c2f_residual_head is None
+            or self.c2f_gate is None
+        ):
+            return raw_offsets, None
+
+        c2f_boxes = boxes_cxcywh.detach()
+        roi_maps = self._pool_point_local_maps(
+            proj_feats,
+            c2f_boxes,
+            roi_type='top',
+            output_size=self.c2f_roi_size,
+        ).detach()
+        bs, query_count, channels, roi_h, roi_w = roi_maps.shape
+        flat_maps = roi_maps.reshape(bs * query_count, channels, roi_h, roi_w)
+        encoded = self.c2f_roi_encoder(flat_maps)
+        encoded = F.interpolate(
+            encoded,
+            size=(self.c2f_grid_size, self.c2f_grid_size),
+            mode='bilinear',
+            align_corners=False,
+        )
+        grid_logits = self.c2f_grid_head(encoded).flatten(1).reshape(bs, query_count, -1)
+        residual_map = self.c2f_residual_head(encoded)
+        residual = residual_map.permute(0, 2, 3, 1).reshape(bs, query_count, -1, 2)
+        if self.c2f_residual_tanh:
+            residual = torch.tanh(residual)
+        residual = residual.to(dtype=raw_offsets.dtype) * (0.5 / float(self.c2f_grid_size))
+
+        prob = F.softmax(grid_logits, dim=-1).to(dtype=raw_offsets.dtype)
+        centers = self._c2f_cell_centers(raw_offsets.device, raw_offsets.dtype).view(1, 1, -1, 2)
+        local_pred = ((centers + residual) * prob.unsqueeze(-1)).sum(dim=2)
+        raw_local, _ = top_roi_local_from_boxes_and_offsets(
+            c2f_boxes,
+            raw_offsets,
+            offset_mode='top_center',
+            top_anchor_ratio=0.12,
+            roi_width_scale=self.point_top_local_width_scale,
+            roi_y_min_ratio=self.point_top_local_y_min_ratio,
+            roi_y_max_ratio=self.point_top_local_y_max_ratio,
+        )
+        local_delta = local_pred - raw_local.to(dtype=raw_offsets.dtype)
+        delta_offsets = top_roi_offsets_from_local_delta(
+            c2f_boxes,
+            local_delta,
+            roi_width_scale=self.point_top_local_width_scale,
+            roi_y_min_ratio=self.point_top_local_y_min_ratio,
+            roi_y_max_ratio=self.point_top_local_y_max_ratio,
+        ).to(dtype=raw_offsets.dtype)
+        gate = self.c2f_gate.to(device=raw_offsets.device, dtype=raw_offsets.dtype)
+        refined_offsets = raw_offsets + gate * delta_offsets
+        entropy = -(prob * prob.clamp(min=1e-8).log()).sum(dim=-1)
+        debug = {
+            'raw': raw_offsets,
+            'grid_logits': grid_logits,
+            'cell_residuals': residual,
+            'delta_offsets': delta_offsets,
+            'gate': gate.reshape(1),
+            'grid_entropy': entropy,
+            'toproi_maps_shape': torch.tensor(roi_maps.shape, device=raw_offsets.device),
+        }
+        return refined_offsets, debug
 
     @staticmethod
     def _init_cls_head_bias(head, bias):
@@ -2328,6 +2576,7 @@ class DFINETransformer(nn.Module):
                 self.pre_dpo_x_head,
                 self.pre_dpo_y_head,
             )
+            pre_picking_offsets, pre_hrpb_debug = self._apply_hrpb_offsets(pre_picking_offsets, pre_bboxes, proj_feats)
             pre_grouped_picking_offsets = self._predict_grouped_picking_offsets(
                 pre_hidden,
                 pre_bboxes,
@@ -2356,6 +2605,8 @@ class DFINETransformer(nn.Module):
             out_dpo_blend_offsets_list = []
             final_qdpt_debug = None
             final_dpo_debug = None
+            final_hrpb_debug = None
+            final_c2f_debug = None
             final_decoder_layer_idx = out_hidden.shape[0] - 1
             for layer_idx in range(out_hidden.shape[0]):
                 heatmap_head_i = None
@@ -2392,6 +2643,10 @@ class DFINETransformer(nn.Module):
                     self.dec_dpo_x_head[layer_idx] if self.dec_dpo_x_head is not None else None,
                     self.dec_dpo_y_head[layer_idx] if self.dec_dpo_y_head is not None else None,
                 )
+                offsets_i, hrpb_debug_i = self._apply_hrpb_offsets(offsets_i, out_bboxes[layer_idx], proj_feats)
+                c2f_debug_i = None
+                if layer_idx == final_decoder_layer_idx:
+                    offsets_i, c2f_debug_i = self._apply_c2f_ccr_offsets(offsets_i, out_bboxes[layer_idx], proj_feats)
                 grouped_offsets_i = self._predict_grouped_picking_offsets(
                     out_hidden[layer_idx],
                     out_bboxes[layer_idx],
@@ -2430,6 +2685,8 @@ class DFINETransformer(nn.Module):
                 if layer_idx == final_decoder_layer_idx:
                     final_qdpt_debug = qdpt_debug_i
                     final_dpo_debug = dpo_debug_i
+                    final_hrpb_debug = hrpb_debug_i
+                    final_c2f_debug = c2f_debug_i
             out_picking_logits = torch.stack(out_picking_logits_list) if out_picking_logits_list else None
             out_picking_offsets = torch.stack(out_picking_offsets_list) if out_picking_offsets_list else None
             out_grouped_picking_offsets = torch.stack(out_grouped_picking_offsets_list) if out_grouped_picking_offsets_list else None
@@ -2599,6 +2856,8 @@ class DFINETransformer(nn.Module):
             out_dpo_offsets = None
             out_dpo_blend_offsets = None
             final_dpo_debug = None
+            final_hrpb_debug = None
+            final_c2f_debug = None
             dn_out_picking_logits, dn_out_picking_offsets, dn_out_grouped_picking_offsets, dn_out_point_quality_logits, dn_out_point_selector_logits, dn_out_point_accept_logits, dn_out_point_reliability_logits, dn_out_weak_heatmap_logits, dn_out_toproi_simcc_x_logits, dn_out_toproi_simcc_y_logits, dn_out_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
             pre_picking_logits, pre_picking_offsets, pre_grouped_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_point_reliability_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
             dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_grouped_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_point_reliability_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
@@ -2636,6 +2895,19 @@ class DFINETransformer(nn.Module):
                 out['pred_picking_offsets_prior'] = final_qdpt_debug['prior']
                 out['qdpt_gate'] = final_qdpt_debug['gate']
                 out['qdpt_point_token_norm'] = final_qdpt_debug['point_token_norm']
+            if self.use_hrpb and self.point_hr_debug and final_hrpb_debug is not None:
+                out['pred_picking_offsets_raw'] = final_hrpb_debug['raw']
+                out['pred_picking_offsets_hr_delta'] = final_hrpb_debug['delta']
+                out['point_hr_gate'] = final_hrpb_debug['gate']
+                out['point_hr_feature_norm'] = final_hrpb_debug['feature_norm']
+            if self.use_c2f_ccr and self.c2f_debug and final_c2f_debug is not None:
+                out['pred_picking_offsets_raw'] = final_c2f_debug['raw']
+                out['pred_c2f_grid_logits'] = final_c2f_debug['grid_logits']
+                out['pred_c2f_cell_residuals'] = final_c2f_debug['cell_residuals']
+                out['pred_c2f_delta_offsets'] = final_c2f_debug['delta_offsets']
+                out['c2f_gate'] = final_c2f_debug['gate']
+                out['c2f_grid_entropy'] = final_c2f_debug['grid_entropy']
+                out['c2f_toproi_maps_shape'] = final_c2f_debug['toproi_maps_shape']
             if out_dpo_x_logits is not None and out_dpo_y_logits is not None:
                 out['pred_dpo_logits_x'] = out_dpo_x_logits[-1]
                 out['pred_dpo_logits_y'] = out_dpo_y_logits[-1]

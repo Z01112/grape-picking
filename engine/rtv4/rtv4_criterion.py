@@ -17,7 +17,10 @@ import copy
 
 from .dfine_utils import bbox2distance
 from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
-from .point_utils import absolute_points_from_boxes_and_offsets
+from .point_utils import (
+    absolute_points_from_boxes_and_offsets,
+    top_roi_local_from_boxes_and_points,
+)
 from ..misc.dist_utils import get_world_size, is_dist_available_and_initialized
 from ..core import register
 
@@ -111,6 +114,13 @@ class RTv4Criterion(nn.Module):
                   point_lsd_offset_mode='top_center',
                   point_lsd_top_anchor_ratio=0.12,
                   point_lsd_anchor_x_ratio=0.5,
+                  c2f_grid_size=7,
+                  c2f_offset_mode='top_center',
+                  c2f_top_anchor_ratio=0.12,
+                  c2f_anchor_x_ratio=0.5,
+                  c2f_toproi_width_scale=1.08,
+                  c2f_toproi_y_min_ratio=-0.10,
+                  c2f_toproi_y_max_ratio=0.40,
                   dpo_num_bins_x=96,
                   dpo_num_bins_y=96,
                   dpo_x_min=-1.0,
@@ -227,6 +237,13 @@ class RTv4Criterion(nn.Module):
         self.point_lsd_offset_mode = str(point_lsd_offset_mode)
         self.point_lsd_top_anchor_ratio = float(point_lsd_top_anchor_ratio)
         self.point_lsd_anchor_x_ratio = float(point_lsd_anchor_x_ratio)
+        self.c2f_grid_size = max(int(c2f_grid_size), 2)
+        self.c2f_offset_mode = str(c2f_offset_mode)
+        self.c2f_top_anchor_ratio = float(c2f_top_anchor_ratio)
+        self.c2f_anchor_x_ratio = float(c2f_anchor_x_ratio)
+        self.c2f_toproi_width_scale = float(c2f_toproi_width_scale)
+        self.c2f_toproi_y_min_ratio = float(c2f_toproi_y_min_ratio)
+        self.c2f_toproi_y_max_ratio = float(c2f_toproi_y_max_ratio)
         self.dpo_num_bins_x = max(int(dpo_num_bins_x), 2)
         self.dpo_num_bins_y = max(int(dpo_num_bins_y), 2)
         self.dpo_x_min = float(dpo_x_min)
@@ -717,6 +734,96 @@ class RTv4Criterion(nn.Module):
 
         loss = (point_loss * sample_weights).sum() / max(int(valid.sum().item()), 1)
         return {'loss_picking_offset': loss}
+
+    def _build_c2f_targets(self, outputs, targets, indices):
+        required = ('pred_c2f_grid_logits', 'pred_c2f_cell_residuals', 'pred_boxes')
+        if any(key not in outputs for key in required):
+            return None
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]
+        if src_boxes.numel() == 0:
+            return None
+
+        target_has = torch.cat(
+            [t['has_picking'][j] for t, (_, j) in zip(targets, indices)],
+            dim=0,
+        ).to(device=src_boxes.device, dtype=torch.float32)
+        target_boxes = torch.cat(
+            [t['boxes'][j] for t, (_, j) in zip(targets, indices)],
+            dim=0,
+        ).to(device=src_boxes.device, dtype=torch.float32)
+        target_offsets = torch.cat(
+            [t['picking_offsets'][j] for t, (_, j) in zip(targets, indices)],
+            dim=0,
+        ).to(device=src_boxes.device, dtype=torch.float32)
+        target_points = absolute_points_from_boxes_and_offsets(
+            target_boxes,
+            target_offsets,
+            mode=self.c2f_offset_mode,
+            top_anchor_ratio=self.c2f_top_anchor_ratio,
+            anchor_x_ratio=self.c2f_anchor_x_ratio,
+        )
+        target_local, in_roi = top_roi_local_from_boxes_and_points(
+            src_boxes.detach(),
+            target_points,
+            roi_width_scale=self.c2f_toproi_width_scale,
+            roi_y_min_ratio=self.c2f_toproi_y_min_ratio,
+            roi_y_max_ratio=self.c2f_toproi_y_max_ratio,
+        )
+        visible = target_has > 0.5
+        valid = visible & in_roi
+        grid = self.c2f_grid_size
+        clamped = target_local.clamp(min=0.0, max=1.0 - 1e-6)
+        cell_x = torch.floor(clamped[:, 0] * grid).to(dtype=torch.long).clamp(0, grid - 1)
+        cell_y = torch.floor(clamped[:, 1] * grid).to(dtype=torch.long).clamp(0, grid - 1)
+        cell_index = cell_y * grid + cell_x
+        center = torch.stack(
+            (
+                (cell_x.to(dtype=target_local.dtype) + 0.5) / float(grid),
+                (cell_y.to(dtype=target_local.dtype) + 0.5) / float(grid),
+            ),
+            dim=-1,
+        )
+        residual_target = target_local - center
+        return {
+            'idx': idx,
+            'valid': valid,
+            'visible': visible,
+            'in_roi': in_roi,
+            'cell_index': cell_index,
+            'residual_target': residual_target,
+            'target_local': target_local,
+        }
+
+    def loss_c2f_coarse(self, outputs, targets, indices, num_boxes, **kwargs):
+        if 'pred_c2f_grid_logits' not in outputs:
+            return {}
+        built = self._build_c2f_targets(outputs, targets, indices)
+        if built is None:
+            return {'loss_c2f_coarse_ce': outputs['pred_c2f_grid_logits'].sum() * 0.0}
+        idx = built['idx']
+        valid = built['valid']
+        logits = outputs['pred_c2f_grid_logits'][idx]
+        if not valid.any():
+            return {'loss_c2f_coarse_ce': outputs['pred_c2f_grid_logits'].sum() * 0.0}
+        loss = F.cross_entropy(logits[valid], built['cell_index'][valid], reduction='mean')
+        return {'loss_c2f_coarse_ce': loss}
+
+    def loss_c2f_fine(self, outputs, targets, indices, num_boxes, **kwargs):
+        if 'pred_c2f_cell_residuals' not in outputs:
+            return {}
+        built = self._build_c2f_targets(outputs, targets, indices)
+        if built is None:
+            return {'loss_c2f_fine_l1': outputs['pred_c2f_cell_residuals'].sum() * 0.0}
+        idx = built['idx']
+        valid = built['valid']
+        residuals = outputs['pred_c2f_cell_residuals'][idx]
+        if not valid.any():
+            return {'loss_c2f_fine_l1': outputs['pred_c2f_cell_residuals'].sum() * 0.0}
+        gather_index = built['cell_index'].view(-1, 1, 1).expand(-1, 1, 2)
+        pred = residuals.gather(1, gather_index).squeeze(1)
+        loss = F.smooth_l1_loss(pred[valid], built['residual_target'][valid].to(dtype=pred.dtype), reduction='mean')
+        return {'loss_c2f_fine_l1': loss}
 
     def _dpo_soft_target(self, values: torch.Tensor, axis: str) -> torch.Tensor:
         if axis == 'x':
@@ -1633,6 +1740,8 @@ class RTv4Criterion(nn.Module):
             'local': self.loss_local,
             'has_picking': self.loss_has_picking,
             'picking_offset': self.loss_picking_offset,
+            'c2f_coarse': self.loss_c2f_coarse,
+            'c2f_fine': self.loss_c2f_fine,
             'dpo': self.loss_dpo,
             'grouped_picking_offset': self.loss_grouped_picking_offset,
             'point_lsd': self.loss_point_lsd,
@@ -1699,7 +1808,7 @@ class RTv4Criterion(nn.Module):
 
         # Compute all the requested losses, main loss
         losses = {}
-        main_only_losses = {'dpo', 'point_lsd', 'picking_locality', 'point_selector', 'point_accept', 'point_reliability', 'toproi_heatmap', 'has_logit_distill'}
+        main_only_losses = {'dpo', 'c2f_coarse', 'c2f_fine', 'point_lsd', 'picking_locality', 'point_selector', 'point_accept', 'point_reliability', 'toproi_heatmap', 'has_logit_distill'}
         for loss_name in self.losses:
             # TODO, indices and num_box are different from RT-DETRv2
             if loss_name == 'distill':
