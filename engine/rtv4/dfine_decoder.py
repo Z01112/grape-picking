@@ -452,6 +452,11 @@ class DFINETransformer(nn.Module):
                  layer_scale=1,
                  mlp_act='relu',
                  use_picking_point_head=False,
+                 use_stem_aux=False,
+                 stem_aux_type='visibility',
+                 stem_aux_loss_weight=0.2,
+                 stem_aux_input='query',
+                 stem_aux_debug=True,
                  has_picking_head_layers=1,
                  picking_offset_head_layers=3,
                  use_point_quality_head=False,
@@ -572,6 +577,15 @@ class DFINETransformer(nn.Module):
         self.aux_loss = aux_loss
         self.reg_max = reg_max
         self.use_picking_point_head = use_picking_point_head
+        self.use_stem_aux = bool(use_stem_aux)
+        self.stem_aux_type = str(stem_aux_type).strip().lower()
+        self.stem_aux_loss_weight = float(stem_aux_loss_weight)
+        self.stem_aux_input = str(stem_aux_input).strip().lower()
+        self.stem_aux_debug = bool(stem_aux_debug)
+        if self.stem_aux_type != 'visibility':
+            raise ValueError(f"Unsupported stem_aux_type: {stem_aux_type}")
+        if self.stem_aux_input != 'query':
+            raise ValueError(f"Unsupported stem_aux_input: {stem_aux_input}")
         self.has_picking_head_layers = max(int(has_picking_head_layers), 1)
         self.picking_offset_head_layers = max(int(picking_offset_head_layers), 1)
         self.use_point_quality_head = bool(use_point_quality_head)
@@ -776,6 +790,7 @@ class DFINETransformer(nn.Module):
           + [nn.Linear(scaled_dim, num_classes) for _ in range(num_layers - self.eval_idx - 1)])
         self.dec_picking_head = None
         self.dec_picking_offset_head = None
+        self.dec_stem_head = None
         self.dec_point_quality_head = None
         self.dec_point_selector_head = None
         self.dec_point_accept_head = None
@@ -786,6 +801,7 @@ class DFINETransformer(nn.Module):
         self.dec_toproi_heatmap_head = None
         self.pre_picking_head = None
         self.pre_picking_offset_head = None
+        self.pre_stem_head = None
         self.pre_point_quality_head = None
         self.pre_point_selector_head = None
         self.pre_point_accept_head = None
@@ -881,6 +897,24 @@ class DFINETransformer(nn.Module):
                 self.picking_offset_head_layers,
                 mlp_act,
             )
+            if self.use_stem_aux:
+                self.dec_stem_head = nn.ModuleList(
+                    [
+                        self._make_point_head(hidden_dim, point_hidden_dim, 1, self.has_picking_head_layers, mlp_act)
+                        for _ in range(self.eval_idx + 1)
+                    ]
+                  + [
+                        self._make_point_head(scaled_dim, point_hidden_dim_scaled, 1, self.has_picking_head_layers, mlp_act)
+                        for _ in range(num_layers - self.eval_idx - 1)
+                    ]
+                )
+                self.pre_stem_head = self._make_point_head(
+                    hidden_dim,
+                    point_hidden_dim,
+                    1,
+                    self.has_picking_head_layers,
+                    mlp_act,
+                )
             if self.use_point_quality_head:
                 self.dec_point_quality_head = nn.ModuleList(
                     [
@@ -2587,9 +2621,15 @@ class DFINETransformer(nn.Module):
                 self.pre_grouped_offset_head,
                 pre_picking_offsets,
             )
+            pre_stem_logits = (
+                self.pre_stem_head(pre_hidden)
+                if self.use_stem_aux and self.pre_stem_head is not None and pre_hidden is not None
+                else None
+            )
 
             out_picking_logits_list = []
             out_picking_offsets_list = []
+            out_stem_logits_list = []
             out_grouped_picking_offsets_list = []
             out_point_quality_logits_list = []
             out_point_selector_logits_list = []
@@ -2644,6 +2684,11 @@ class DFINETransformer(nn.Module):
                     self.dec_dpo_y_head[layer_idx] if self.dec_dpo_y_head is not None else None,
                 )
                 offsets_i, hrpb_debug_i = self._apply_hrpb_offsets(offsets_i, out_bboxes[layer_idx], proj_feats)
+                stem_i = (
+                    self.dec_stem_head[layer_idx](out_hidden[layer_idx])
+                    if self.use_stem_aux and self.dec_stem_head is not None
+                    else None
+                )
                 c2f_debug_i = None
                 if layer_idx == final_decoder_layer_idx:
                     offsets_i, c2f_debug_i = self._apply_c2f_ccr_offsets(offsets_i, out_bboxes[layer_idx], proj_feats)
@@ -2659,6 +2704,8 @@ class DFINETransformer(nn.Module):
                 )
                 out_picking_logits_list.append(logits_i)
                 out_picking_offsets_list.append(offsets_i)
+                if stem_i is not None:
+                    out_stem_logits_list.append(stem_i)
                 if grouped_offsets_i is not None:
                     out_grouped_picking_offsets_list.append(grouped_offsets_i)
                 if quality_i is not None:
@@ -2689,6 +2736,7 @@ class DFINETransformer(nn.Module):
                     final_c2f_debug = c2f_debug_i
             out_picking_logits = torch.stack(out_picking_logits_list) if out_picking_logits_list else None
             out_picking_offsets = torch.stack(out_picking_offsets_list) if out_picking_offsets_list else None
+            out_stem_logits = torch.stack(out_stem_logits_list) if out_stem_logits_list else None
             out_grouped_picking_offsets = torch.stack(out_grouped_picking_offsets_list) if out_grouped_picking_offsets_list else None
             out_point_quality_logits = torch.stack(out_point_quality_logits_list) if out_point_quality_logits_list else None
             out_point_selector_logits = torch.stack(out_point_selector_logits_list) if out_point_selector_logits_list else None
@@ -2842,6 +2890,7 @@ class DFINETransformer(nn.Module):
         else:
             out_picking_logits = None
             out_picking_offsets = None
+            out_stem_logits = None
             out_grouped_picking_offsets = None
             out_point_quality_logits = None
             out_point_selector_logits = None
@@ -2859,7 +2908,7 @@ class DFINETransformer(nn.Module):
             final_hrpb_debug = None
             final_c2f_debug = None
             dn_out_picking_logits, dn_out_picking_offsets, dn_out_grouped_picking_offsets, dn_out_point_quality_logits, dn_out_point_selector_logits, dn_out_point_accept_logits, dn_out_point_reliability_logits, dn_out_weak_heatmap_logits, dn_out_toproi_simcc_x_logits, dn_out_toproi_simcc_y_logits, dn_out_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
-            pre_picking_logits, pre_picking_offsets, pre_grouped_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_point_reliability_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
+            pre_picking_logits, pre_picking_offsets, pre_stem_logits, pre_grouped_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_point_reliability_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None, None
             dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_grouped_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_point_reliability_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
 
 
@@ -2872,6 +2921,8 @@ class DFINETransformer(nn.Module):
             # Final per-query outputs consumed by criterion and postprocessor.
             out['pred_has_picking'] = out_picking_logits[-1]
             out['pred_picking_offsets'] = out_picking_offsets[-1]
+            if out_stem_logits is not None:
+                out['pred_has_stem'] = out_stem_logits[-1]
             if out_grouped_picking_offsets is not None:
                 out['pred_grouped_picking_offsets'] = out_grouped_picking_offsets[-1]
             if out_point_quality_logits is not None:
@@ -2931,6 +2982,7 @@ class DFINETransformer(nn.Module):
                 out_logits[-1],
                 out_picking_logits[:-1] if out_picking_logits is not None else None,
                 out_picking_offsets[:-1] if out_picking_offsets is not None else None,
+                out_stem_logits[:-1] if out_stem_logits is not None else None,
                 out_grouped_picking_offsets[:-1] if out_grouped_picking_offsets is not None else None,
                 out_point_quality_logits[:-1] if out_point_quality_logits is not None else None,
                 out_point_selector_logits[:-1] if out_point_selector_logits is not None else None,
@@ -2946,6 +2998,8 @@ class DFINETransformer(nn.Module):
             if pre_picking_logits is not None:
                 out['pre_outputs']['pred_has_picking'] = pre_picking_logits
                 out['pre_outputs']['pred_picking_offsets'] = pre_picking_offsets
+                if pre_stem_logits is not None:
+                    out['pre_outputs']['pred_has_stem'] = pre_stem_logits
                 if pre_grouped_picking_offsets is not None:
                     out['pre_outputs']['pred_grouped_picking_offsets'] = pre_grouped_picking_offsets
                 if pre_point_quality_logits is not None:
@@ -2975,6 +3029,7 @@ class DFINETransformer(nn.Module):
                     dn_out_logits[-1],
                     dn_out_picking_logits,
                     dn_out_picking_offsets,
+                    None,
                     dn_out_grouped_picking_offsets,
                     dn_out_point_quality_logits,
                     dn_out_point_selector_logits,
@@ -3063,6 +3118,7 @@ class DFINETransformer(nn.Module):
     def _set_aux_loss2(self, outputs_class, outputs_coord, outputs_corners, outputs_ref,
                        teacher_corners=None, teacher_logits=None,
                        outputs_picking_logits=None, outputs_picking_offsets=None,
+                       outputs_stem_logits=None,
                        outputs_grouped_picking_offsets=None,
                        outputs_point_quality_logits=None,
                        outputs_point_selector_logits=None,
@@ -3089,6 +3145,8 @@ class DFINETransformer(nn.Module):
                 item['pred_has_picking'] = outputs_picking_logits[idx]
             if outputs_picking_offsets is not None:
                 item['pred_picking_offsets'] = outputs_picking_offsets[idx]
+            if outputs_stem_logits is not None:
+                item['pred_has_stem'] = outputs_stem_logits[idx]
             if outputs_grouped_picking_offsets is not None:
                 item['pred_grouped_picking_offsets'] = outputs_grouped_picking_offsets[idx]
             if outputs_point_quality_logits is not None:

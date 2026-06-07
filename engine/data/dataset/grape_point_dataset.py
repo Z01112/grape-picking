@@ -95,6 +95,7 @@ class GrapePointCocoDetection(CocoDetection):
     def _pop_point_targets(target: dict):
         return {
             "has_picking": target.pop("has_picking", None),
+            "has_stem": target.pop("has_stem", None),
             "picking_offsets": target.pop("picking_offsets", None),
             "picking_points": target.pop("picking_points", None),
         }
@@ -110,6 +111,13 @@ class GrapePointCocoDetection(CocoDetection):
             target["has_picking"] = torch.zeros((num_instances,), dtype=torch.float32, device=device)
         else:
             target["has_picking"] = target["has_picking"].to(dtype=torch.float32, device=device)
+
+        if "has_stem" not in target:
+            target["has_stem"] = torch.zeros((num_instances,), dtype=torch.float32, device=device)
+        elif target["has_stem"] is None:
+            target["has_stem"] = torch.zeros((num_instances,), dtype=torch.float32, device=device)
+        else:
+            target["has_stem"] = target["has_stem"].to(dtype=torch.float32, device=device)
 
         if "picking_offsets" not in target:
             target["picking_offsets"] = torch.zeros((num_instances, 2), dtype=torch.float32, device=device)

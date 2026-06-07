@@ -1,0 +1,51 @@
+__include__: [
+  ./rtv4_hgnetv2_s_grape_point_enc_ema_bifpn_weighted_fusion.yml
+]
+
+output_dir: ./outputs/01_mainline_results/ema_bifpn_new1804_fair100
+
+num_classes: 1
+remap_mscoco_category: false
+use_ema: true
+epoches: 100
+
+train_dataloader:
+  dataset:
+    img_folder: ./datasets/train
+    ann_file: ./datasets/train/_annotations.grape_point.json
+    regenerate_point_offsets: true
+    point_offset_mode: top_center
+    point_top_anchor_ratio: 0.12
+
+val_dataloader:
+  dataset:
+    img_folder: ./datasets/valid
+    ann_file: ./datasets/valid/_annotations.grape_point.json
+    regenerate_point_offsets: true
+    point_offset_mode: top_center
+    point_top_anchor_ratio: 0.12
+
+HGNetv2:
+  pretrained: true
+  local_model_dir: ./pretrain/hgnetv2/
+
+HybridEncoder:
+  use_cada: false
+  ema_mode: ema
+  ema_groups: 8
+  weighted_fusion_mode: bifpn
+  weighted_fusion_eps: 0.0001
+
+DFINETransformer:
+  use_dpo_head: false
+  use_qdpt_lite: false
+  use_c2f_ccr: false
+  use_toproi_simcc_refiner: false
+  use_toproi_heatmap_refiner: false
+  use_grouped_picking_query: false
+  use_point_reliability_head: false
+  use_point_selector_head: false
+  use_point_accept_head: false
+
+RTv4Criterion:
+  losses: [mal, boxes, local, has_picking, picking_offset]

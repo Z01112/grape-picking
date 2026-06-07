@@ -47,6 +47,7 @@ wandb/
 
 # Data / big assets / external code
 /dataset/
+/datasets/
 /pretrain/
 /third_party/
 

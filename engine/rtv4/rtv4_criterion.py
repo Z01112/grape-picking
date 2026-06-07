@@ -518,6 +518,27 @@ class RTv4Criterion(nn.Module):
         loss = F.binary_cross_entropy_with_logits(src_logits, target_has_picking, reduction='mean')
         return {'loss_has_picking': loss}
 
+    def loss_has_stem(self, outputs, targets, indices, num_boxes, **kwargs):
+        """Auxiliary stem visibility loss on matched grape queries only."""
+        if 'pred_has_stem' not in outputs:
+            return {}
+
+        idx = self._get_src_permutation_idx(indices)
+        src_logits = outputs['pred_has_stem'][idx].squeeze(-1)
+        if src_logits.numel() == 0:
+            return {'loss_has_stem': outputs['pred_has_stem'].sum() * 0.0}
+
+        target_has_stem = torch.cat(
+            [
+                t.get('has_stem', torch.zeros_like(t['labels'], dtype=torch.float32))[j]
+                for t, (_, j) in zip(targets, indices)
+            ],
+            dim=0,
+        ).to(dtype=src_logits.dtype, device=src_logits.device)
+
+        loss = F.binary_cross_entropy_with_logits(src_logits, target_has_stem, reduction='mean')
+        return {'loss_has_stem': loss}
+
     def _gather_matched_point_examples(self, outputs, targets, indices, offset_key='pred_picking_offsets'):
         """Collect point targets for the same matched queries used by box loss."""
         idx = self._get_src_permutation_idx(indices)
@@ -1739,6 +1760,7 @@ class RTv4Criterion(nn.Module):
             'mal': self.loss_labels_mal,
             'local': self.loss_local,
             'has_picking': self.loss_has_picking,
+            'has_stem': self.loss_has_stem,
             'picking_offset': self.loss_picking_offset,
             'c2f_coarse': self.loss_c2f_coarse,
             'c2f_fine': self.loss_c2f_fine,
