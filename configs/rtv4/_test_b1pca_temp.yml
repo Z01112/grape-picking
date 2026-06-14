@@ -1,0 +1,11 @@
+__include__: [
+  ./rtv4_hgnetv2_b1_s_grape_point_ema_bifpn_new1804_point_cross_attn_fair100.yml
+]
+
+val_dataloader:
+  dataset:
+    img_folder: ./datasets/test
+    ann_file: ./datasets/test/_annotations.grape_point.json
+    regenerate_point_offsets: true
+    point_offset_mode: top_center
+    point_top_anchor_ratio: 0.12

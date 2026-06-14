@@ -27,6 +27,13 @@ def point_from_xywh_bbox(box_xywh: Iterable[float]) -> list[float]:
     return [x + 0.5 * w, y + 0.5 * h]
 
 
+def _to_float_or_tensor(value, boxes_cxcywh):
+    """Normalize a top_anchor_ratio that may be float or tensor."""
+    if isinstance(value, torch.Tensor):
+        return value.to(dtype=boxes_cxcywh.dtype, device=boxes_cxcywh.device)
+    return float(value)
+
+
 def _point_anchor_from_xywh_bbox(
     box_xywh: Iterable[float],
     mode: str = "center",
@@ -94,7 +101,8 @@ def absolute_points_from_boxes_and_offsets(
         centers[..., 1] = boxes_cxcywh[..., 1] - 0.5 * boxes_cxcywh[..., 3]
     elif mode == "top_center":
         centers[..., 0] = boxes_cxcywh[..., 0] - 0.5 * boxes_cxcywh[..., 2] + float(anchor_x_ratio) * boxes_cxcywh[..., 2]
-        centers[..., 1] = boxes_cxcywh[..., 1] - 0.5 * boxes_cxcywh[..., 3] + float(top_anchor_ratio) * boxes_cxcywh[..., 3]
+        ratio = _to_float_or_tensor(top_anchor_ratio, boxes_cxcywh)
+        centers[..., 1] = boxes_cxcywh[..., 1] - 0.5 * boxes_cxcywh[..., 3] + ratio * boxes_cxcywh[..., 3]
     sizes = boxes_cxcywh[..., 2:].clamp(min=1e-6)
     return centers + offsets_xy * sizes
 
@@ -126,7 +134,8 @@ def normalized_offsets_from_boxes_and_points(
         centers[..., 1] = boxes_cxcywh[..., 1] - 0.5 * boxes_cxcywh[..., 3]
     elif mode == "top_center":
         centers[..., 0] = boxes_cxcywh[..., 0] - 0.5 * boxes_cxcywh[..., 2] + float(anchor_x_ratio) * boxes_cxcywh[..., 2]
-        centers[..., 1] = boxes_cxcywh[..., 1] - 0.5 * boxes_cxcywh[..., 3] + float(top_anchor_ratio) * boxes_cxcywh[..., 3]
+        ratio = _to_float_or_tensor(top_anchor_ratio, boxes_cxcywh)
+        centers[..., 1] = boxes_cxcywh[..., 1] - 0.5 * boxes_cxcywh[..., 3] + ratio * boxes_cxcywh[..., 3]
     sizes = boxes_cxcywh[..., 2:].clamp(min=1e-6)
     return (points_xy - centers) / sizes
 

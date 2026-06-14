@@ -1,0 +1,10 @@
+__include__: [
+  ./rtv4_hgnetv2_s_grape_point_ema_bifpn_new1804_fair100.yml
+]
+
+output_dir: ./outputs/01_mainline_results/candidate_b1_backbone_new1804_fair100
+
+HGNetv2:
+  pretrained: true
+  local_model_dir: ./pretrain/hgnetv2/
+  name: B1

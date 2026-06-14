@@ -169,7 +169,10 @@ class BaseSolver(object):
         for k, v in self.__dict__.items():
             if hasattr(v, 'load_state_dict') and k in state:
                 v = dist_utils.de_parallel(v)
-                v.load_state_dict(state[k])
+                if k in ('model', 'ema'):
+                    v.load_state_dict(state[k], strict=False)
+                else:
+                    v.load_state_dict(state[k])
                 print(f'Load {k}.state_dict')
 
             if hasattr(v, 'load_state_dict') and k not in state:

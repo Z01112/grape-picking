@@ -1,0 +1,22 @@
+__include__: [
+  ./rtv4_hgnetv2_s_grape_point_ema_bifpn_point_cross_attn_fair100.yml
+]
+
+output_dir: ./outputs/01_mainline_results/candidate_b0_point_cross_attn_pam_fair100
+
+RTv4Criterion:
+  matcher:
+    type: HungarianMatcher
+    weight_dict:
+      cost_class: 2
+      cost_bbox: 5
+      cost_giou: 2
+      cost_point: 0.02
+    alpha: 0.25
+    gamma: 2.0
+    use_point_cost: true
+    point_cost_type: l2
+    point_cost_visible_only: true
+    point_cost_normalized: true
+    point_cost_start_epoch: 30
+    point_cost_warmup_epochs: 30

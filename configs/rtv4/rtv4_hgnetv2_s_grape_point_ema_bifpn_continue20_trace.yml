@@ -1,6 +1,0 @@
-__include__: [
-  ./rtv4_hgnetv2_s_grape_point_ema_bifpn_continue20_control_rawoffset.yml
-]
-
-output_dir: ./outputs/26_continue_training_tradeoff/ema_bifpn_continue20_trace
-checkpoint_freq: 2

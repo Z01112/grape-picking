@@ -1,0 +1,10 @@
+__include__: [
+  ./rtv4_hgnetv2_s_grape_point_ema_bifpn_new1804_fair100.yml
+]
+
+output_dir: ./outputs/01_mainline_results/candidate_b0_point_cross_attn_fair100
+
+DFINETransformer:
+  use_point_cross_attn: true
+  point_cross_attn_spatial_size: 6
+  point_cross_attn_num_heads: 4

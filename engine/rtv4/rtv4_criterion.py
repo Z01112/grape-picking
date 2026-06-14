@@ -539,6 +539,42 @@ class RTv4Criterion(nn.Module):
         loss = F.binary_cross_entropy_with_logits(src_logits, target_has_stem, reduction='mean')
         return {'loss_has_stem': loss}
 
+    def loss_stem_geom(self, outputs, targets, indices, num_boxes, **kwargs):
+        """Stem geometry loss on matched visible-stem grape queries only."""
+        if 'pred_stem_rel' not in outputs:
+            return {}
+
+        idx = self._get_src_permutation_idx(indices)
+        src_stem_rel = outputs['pred_stem_rel'][idx]
+        if src_stem_rel.numel() == 0:
+            return {'loss_stem_geom': outputs['pred_stem_rel'].sum() * 0.0}
+
+        target_stem_rel = torch.cat(
+            [
+                t.get(
+                    "stem_rel",
+                    torch.zeros((len(j), 4), dtype=torch.float32, device=src_stem_rel.device),
+                )[j].to(dtype=src_stem_rel.dtype, device=src_stem_rel.device)
+                for t, (_, j) in zip(targets, indices)
+            ],
+            dim=0,
+        )
+        target_has_stem = torch.cat(
+            [
+                t.get(
+                    "has_stem",
+                    torch.zeros((len(j),), dtype=torch.float32, device=src_stem_rel.device),
+                )[j].to(dtype=torch.float32, device=src_stem_rel.device)
+                for t, (_, j) in zip(targets, indices)
+            ],
+            dim=0,
+        )
+        valid = target_has_stem > 0.5
+        if not torch.any(valid):
+            return {'loss_stem_geom': outputs['pred_stem_rel'].sum() * 0.0}
+        loss = F.smooth_l1_loss(src_stem_rel[valid], target_stem_rel[valid], beta=0.05, reduction='mean')
+        return {'loss_stem_geom': loss}
+
     def _gather_matched_point_examples(self, outputs, targets, indices, offset_key='pred_picking_offsets'):
         """Collect point targets for the same matched queries used by box loss."""
         idx = self._get_src_permutation_idx(indices)
@@ -1761,6 +1797,7 @@ class RTv4Criterion(nn.Module):
             'local': self.loss_local,
             'has_picking': self.loss_has_picking,
             'has_stem': self.loss_has_stem,
+            'stem_geom': self.loss_stem_geom,
             'picking_offset': self.loss_picking_offset,
             'c2f_coarse': self.loss_c2f_coarse,
             'c2f_fine': self.loss_c2f_fine,

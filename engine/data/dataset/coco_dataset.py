@@ -162,6 +162,18 @@ class ConvertCocoPolysToMask(object):
                 dtype=torch.float32,
             )
 
+        stem_bbox = None
+        if anno and any("stem_bbox" in obj for obj in anno):
+            stem_bbox = torch.as_tensor(
+                [
+                    obj.get("stem_bbox", [0.0, 0.0, 0.0, 0.0])[:4]
+                    if obj.get("stem_bbox") is not None
+                    else [0.0, 0.0, 0.0, 0.0]
+                    for obj in anno
+                ],
+                dtype=torch.float32,
+            )
+
         picking_points = None
         if anno and any("picking_point" in obj for obj in anno):
             picking_points = torch.as_tensor(
@@ -197,6 +209,8 @@ class ConvertCocoPolysToMask(object):
             has_picking = has_picking[keep]
         if has_stem is not None:
             has_stem = has_stem[keep]
+        if stem_bbox is not None:
+            stem_bbox = stem_bbox[keep]
         if picking_points is not None:
             picking_points = picking_points[keep]
         if picking_offsets is not None:
@@ -214,6 +228,8 @@ class ConvertCocoPolysToMask(object):
             target["has_picking"] = has_picking
         if has_stem is not None:
             target["has_stem"] = has_stem
+        if stem_bbox is not None:
+            target["stem_bbox"] = stem_bbox
         if picking_points is not None:
             target["picking_points"] = picking_points
         if picking_offsets is not None:

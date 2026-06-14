@@ -50,6 +50,7 @@ class GrapePointCocoDetection(CocoDetection):
         image, target = super().load_item(idx)
         if self.regenerate_point_offsets:
             target = self._refresh_point_offsets(target)
+        target = self._refresh_stem_rel(target)
         point_targets = self._pop_point_targets(target)
         if self._transforms is not None:
             image, target, _ = self._transforms(image, target, self)
@@ -92,10 +93,51 @@ class GrapePointCocoDetection(CocoDetection):
         return target
 
     @staticmethod
+    def _refresh_stem_rel(target: dict) -> dict:
+        boxes = target.get("boxes")
+        stem_bbox = target.get("stem_bbox")
+        has_stem = target.get("has_stem")
+        if boxes is None or stem_bbox is None or has_stem is None:
+            return target
+        if boxes.numel() == 0:
+            target["stem_rel"] = torch.zeros((0, 4), dtype=torch.float32)
+            return target
+
+        boxes = boxes.to(dtype=torch.float32)
+        stem_bbox = stem_bbox.to(dtype=torch.float32)
+        has_stem = has_stem.to(dtype=torch.float32)
+
+        grape_x1, grape_y1, grape_x2, grape_y2 = boxes.unbind(-1)
+        grape_w = (grape_x2 - grape_x1).clamp(min=1e-6)
+        grape_h = (grape_y2 - grape_y1).clamp(min=1e-6)
+
+        stem_x, stem_y, stem_w, stem_h = stem_bbox.unbind(-1)
+        valid_stem = (has_stem > 0.5) & (stem_w > 0.0) & (stem_h > 0.0)
+        stem_w_safe = stem_w.clamp(min=1e-6)
+        stem_h_safe = stem_h.clamp(min=1e-6)
+        stem_cx = stem_x + 0.5 * stem_w_safe
+        stem_cy = stem_y + 0.5 * stem_h_safe
+
+        stem_rel = torch.stack(
+            (
+                (stem_cx - grape_x1) / grape_w,
+                (stem_cy - grape_y1) / grape_h,
+                stem_w_safe / grape_w,
+                stem_h_safe / grape_h,
+            ),
+            dim=-1,
+        ).clamp(min=-1.0, max=2.0)
+        stem_rel = torch.where(valid_stem.unsqueeze(-1), stem_rel, torch.zeros_like(stem_rel))
+        target["stem_rel"] = stem_rel
+        return target
+
+    @staticmethod
     def _pop_point_targets(target: dict):
+        target.pop("stem_bbox", None)
         return {
             "has_picking": target.pop("has_picking", None),
             "has_stem": target.pop("has_stem", None),
+            "stem_rel": target.pop("stem_rel", None),
             "picking_offsets": target.pop("picking_offsets", None),
             "picking_points": target.pop("picking_points", None),
         }
@@ -118,6 +160,13 @@ class GrapePointCocoDetection(CocoDetection):
             target["has_stem"] = torch.zeros((num_instances,), dtype=torch.float32, device=device)
         else:
             target["has_stem"] = target["has_stem"].to(dtype=torch.float32, device=device)
+
+        if "stem_rel" not in target:
+            target["stem_rel"] = torch.zeros((num_instances, 4), dtype=torch.float32, device=device)
+        elif target["stem_rel"] is None:
+            target["stem_rel"] = torch.zeros((num_instances, 4), dtype=torch.float32, device=device)
+        else:
+            target["stem_rel"] = target["stem_rel"].to(dtype=torch.float32, device=device)
 
         if "picking_offsets" not in target:
             target["picking_offsets"] = torch.zeros((num_instances, 2), dtype=torch.float32, device=device)

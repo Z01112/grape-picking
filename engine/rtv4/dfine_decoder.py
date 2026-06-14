@@ -501,6 +501,11 @@ class DFINETransformer(nn.Module):
                  point_offset_top_local_width_scale=1.08,
                  point_offset_top_local_y_min_ratio=-0.20,
                  point_offset_top_local_y_max_ratio=0.55,
+                 point_anchor_bias_learnable=False,
+                 point_anchor_bias_init=0.12,
+                 use_point_cross_attn=False,
+                 point_cross_attn_spatial_size=6,
+                 point_cross_attn_num_heads=4,
                  use_toproi_simcc_refiner=False,
                  toproi_simcc_head_layers=2,
                  toproi_simcc_detach_input=True,
@@ -556,6 +561,18 @@ class DFINETransformer(nn.Module):
                  c2f_use_toproi_map=True,
                  c2f_residual_tanh=True,
                  c2f_debug=True,
+                 use_stem_spatial_guidance=False,
+                 stem_spatial_guidance_mode='predicted_roi',
+                 stem_geom_head_layers=3,
+                 stem_geom_loss_weight=0.5,
+                 stem_roi_size=5,
+                 stem_roi_level=0,
+                 stem_roi_width_scale=1.20,
+                 stem_roi_height_scale=1.20,
+                 stem_guidance_gate_init=0.0,
+                 stem_guidance_detach_geom_for_roi=True,
+                 stem_guidance_apply_to='offset',
+                 stem_guidance_debug=True,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -648,6 +665,20 @@ class DFINETransformer(nn.Module):
         self.point_offset_top_local_width_scale = float(point_offset_top_local_width_scale)
         self.point_offset_top_local_y_min_ratio = float(point_offset_top_local_y_min_ratio)
         self.point_offset_top_local_y_max_ratio = float(point_offset_top_local_y_max_ratio)
+        if bool(point_anchor_bias_learnable):
+            self.anchor_y_bias = nn.Parameter(torch.tensor([float(point_anchor_bias_init)]))
+        else:
+            self.register_buffer('anchor_y_bias', torch.tensor([float(point_anchor_bias_init)]))
+        if bool(use_point_cross_attn):
+            self.point_cross_attn_size = max(int(point_cross_attn_spatial_size), 2)
+            self.point_cross_attn_heads = max(int(point_cross_attn_num_heads), 1)
+            self.point_cross_attn = nn.MultiheadAttention(
+                hidden_dim, self.point_cross_attn_heads, batch_first=True,
+            )
+            self.point_cross_attn_norm = nn.LayerNorm(hidden_dim)
+            self.point_cross_attn_proj = nn.Linear(hidden_dim, hidden_dim)
+        else:
+            self.point_cross_attn = None
         self.use_toproi_simcc_refiner = bool(use_toproi_simcc_refiner)
         self.toproi_simcc_head_layers = max(int(toproi_simcc_head_layers), 1)
         self.toproi_simcc_detach_input = bool(toproi_simcc_detach_input)
@@ -712,6 +743,22 @@ class DFINETransformer(nn.Module):
         self.c2f_use_toproi_map = bool(c2f_use_toproi_map)
         self.c2f_residual_tanh = bool(c2f_residual_tanh)
         self.c2f_debug = bool(c2f_debug)
+        self.use_stem_spatial_guidance = bool(use_stem_spatial_guidance)
+        self.stem_spatial_guidance_mode = str(stem_spatial_guidance_mode).strip().lower()
+        if self.stem_spatial_guidance_mode != 'predicted_roi':
+            raise ValueError(f"Unsupported stem_spatial_guidance_mode: {stem_spatial_guidance_mode}")
+        self.stem_geom_head_layers = max(int(stem_geom_head_layers), 1)
+        self.stem_geom_loss_weight = float(stem_geom_loss_weight)
+        self.stem_roi_size = max(int(stem_roi_size), 1)
+        self.stem_roi_level = max(int(stem_roi_level), 0)
+        self.stem_roi_width_scale = float(stem_roi_width_scale)
+        self.stem_roi_height_scale = float(stem_roi_height_scale)
+        self.stem_guidance_gate_init = float(stem_guidance_gate_init)
+        self.stem_guidance_detach_geom_for_roi = bool(stem_guidance_detach_geom_for_roi)
+        self.stem_guidance_apply_to = str(stem_guidance_apply_to).strip().lower()
+        if self.stem_guidance_apply_to != 'offset':
+            raise ValueError(f"Unsupported stem_guidance_apply_to: {stem_guidance_apply_to}")
+        self.stem_guidance_debug = bool(stem_guidance_debug)
         if isinstance(point_hr_levels, str):
             point_hr_levels = [item.strip() for item in point_hr_levels.split(',') if item.strip()]
         self.point_hr_levels = [str(level).strip().upper() for level in point_hr_levels]
@@ -857,6 +904,16 @@ class DFINETransformer(nn.Module):
         self.c2f_grid_head = None
         self.c2f_residual_head = None
         self.c2f_gate = None
+        self.dec_stem_geom_head = None
+        self.pre_stem_geom_head = None
+        self.dec_stem_roi_proj = None
+        self.pre_stem_roi_proj = None
+        self.dec_stem_geom_proj = None
+        self.pre_stem_geom_proj = None
+        self.dec_stem_guidance_fusion = None
+        self.pre_stem_guidance_fusion = None
+        self.dec_stem_guidance_gate = None
+        self.pre_stem_guidance_gate = None
         if self.use_picking_point_head:
             # Per-grape-query picking heads: has_picking classifies whether the
             # matched grape has a visible picking point, while point_offset
@@ -915,6 +972,55 @@ class DFINETransformer(nn.Module):
                     self.has_picking_head_layers,
                     mlp_act,
                 )
+            if self.use_stem_spatial_guidance:
+                self.dec_stem_geom_head = nn.ModuleList(
+                    [
+                        self._make_point_head(hidden_dim, point_hidden_dim, 4, self.stem_geom_head_layers, mlp_act)
+                        for _ in range(self.eval_idx + 1)
+                    ]
+                  + [
+                        self._make_point_head(scaled_dim, point_hidden_dim_scaled, 4, self.stem_geom_head_layers, mlp_act)
+                        for _ in range(num_layers - self.eval_idx - 1)
+                    ]
+                )
+                self.pre_stem_geom_head = self._make_point_head(
+                    hidden_dim,
+                    point_hidden_dim,
+                    4,
+                    self.stem_geom_head_layers,
+                    mlp_act,
+                )
+                self.dec_stem_roi_proj = nn.ModuleList(
+                    [nn.Linear(hidden_dim, hidden_dim) for _ in range(self.eval_idx + 1)]
+                  + [nn.Linear(hidden_dim, scaled_dim) for _ in range(num_layers - self.eval_idx - 1)]
+                )
+                self.pre_stem_roi_proj = nn.Linear(hidden_dim, hidden_dim)
+                self.dec_stem_geom_proj = nn.ModuleList(
+                    [
+                        self._make_point_head(4, point_hidden_dim, hidden_dim, 2, mlp_act)
+                        for _ in range(self.eval_idx + 1)
+                    ]
+                  + [
+                        self._make_point_head(4, point_hidden_dim_scaled, scaled_dim, 2, mlp_act)
+                        for _ in range(num_layers - self.eval_idx - 1)
+                    ]
+                )
+                self.pre_stem_geom_proj = self._make_point_head(4, point_hidden_dim, hidden_dim, 2, mlp_act)
+                self.dec_stem_guidance_fusion = nn.ModuleList(
+                    [
+                        self._make_point_head(hidden_dim * 3, point_hidden_dim, hidden_dim, 2, mlp_act)
+                        for _ in range(self.eval_idx + 1)
+                    ]
+                  + [
+                        self._make_point_head(scaled_dim * 3, point_hidden_dim_scaled, scaled_dim, 2, mlp_act)
+                        for _ in range(num_layers - self.eval_idx - 1)
+                    ]
+                )
+                self.pre_stem_guidance_fusion = self._make_point_head(hidden_dim * 3, point_hidden_dim, hidden_dim, 2, mlp_act)
+                self.dec_stem_guidance_gate = nn.ParameterList(
+                    [nn.Parameter(torch.tensor(self.stem_guidance_gate_init, dtype=torch.float32)) for _ in range(num_layers)]
+                )
+                self.pre_stem_guidance_gate = nn.Parameter(torch.tensor(self.stem_guidance_gate_init, dtype=torch.float32))
             if self.use_point_quality_head:
                 self.dec_point_quality_head = nn.ModuleList(
                     [
@@ -2014,6 +2120,113 @@ class DFINETransformer(nn.Module):
         fused_delta = fusion_head(torch.cat(parts, dim=-1))
         return hidden + fused_delta
 
+    def _decode_stem_roi_boxes(
+        self,
+        pred_stem_rel: torch.Tensor,
+        boxes_cxcywh: torch.Tensor,
+    ) -> torch.Tensor:
+        if pred_stem_rel is None or boxes_cxcywh is None:
+            return None
+        rel = torch.nan_to_num(pred_stem_rel.to(dtype=boxes_cxcywh.dtype), nan=0.0, posinf=2.0, neginf=-1.0)
+        rel_cx = rel[..., 0].clamp(min=-1.0, max=2.0)
+        rel_cy = rel[..., 1].clamp(min=-1.0, max=2.0)
+        rel_w = rel[..., 2].clamp(min=1e-4, max=2.0)
+        rel_h = rel[..., 3].clamp(min=1e-4, max=2.0)
+
+        grape = boxes_cxcywh.to(dtype=rel.dtype).clamp(min=0.0, max=1.0)
+        grape_cx, grape_cy, grape_w, grape_h = grape.unbind(-1)
+        grape_w = grape_w.clamp(min=1e-6)
+        grape_h = grape_h.clamp(min=1e-6)
+        grape_x1 = grape_cx - 0.5 * grape_w
+        grape_y1 = grape_cy - 0.5 * grape_h
+
+        stem_cx = grape_x1 + rel_cx * grape_w
+        stem_cy = grape_y1 + rel_cy * grape_h
+        stem_w = (rel_w * grape_w * self.stem_roi_width_scale).clamp(min=1e-4, max=1.0)
+        stem_h = (rel_h * grape_h * self.stem_roi_height_scale).clamp(min=1e-4, max=1.0)
+        stem_cx = stem_cx.clamp(min=0.0, max=1.0)
+        stem_cy = stem_cy.clamp(min=0.0, max=1.0)
+        return torch.stack((stem_cx, stem_cy, stem_w, stem_h), dim=-1)
+
+    def _build_scaled_rois_from_cxcywh(self, boxes_cxcywh: torch.Tensor, feat_h: int, feat_w: int) -> torch.Tensor:
+        boxes = boxes_cxcywh.to(torch.float32)
+        cx, cy, w, h = boxes.unbind(-1)
+        x1 = (cx - 0.5 * w) * feat_w
+        y1 = (cy - 0.5 * h) * feat_h
+        x2 = (cx + 0.5 * w) * feat_w
+        y2 = (cy + 0.5 * h) * feat_h
+        x1 = x1.clamp(min=0.0, max=max(float(feat_w - 1), 0.0))
+        y1 = y1.clamp(min=0.0, max=max(float(feat_h - 1), 0.0))
+        x2 = torch.maximum(x2.clamp(min=0.0, max=float(feat_w)), x1 + 1e-3)
+        y2 = torch.maximum(y2.clamp(min=0.0, max=float(feat_h)), y1 + 1e-3)
+        return torch.stack((x1, y1, x2, y2), dim=-1)
+
+    def _pool_stem_roi_features(
+        self,
+        proj_feats: List[torch.Tensor],
+        stem_roi_boxes_cxcywh: torch.Tensor,
+    ) -> torch.Tensor:
+        if stem_roi_boxes_cxcywh is None:
+            return None
+        level_idx = min(self.stem_roi_level, len(proj_feats) - 1)
+        feat = proj_feats[level_idx]
+        bs, _, feat_h, feat_w = feat.shape
+        _, query_count, _ = stem_roi_boxes_cxcywh.shape
+        if query_count == 0:
+            return feat.new_zeros((bs, 0, feat.shape[1]))
+        rois_xyxy = self._build_scaled_rois_from_cxcywh(stem_roi_boxes_cxcywh, feat_h, feat_w)
+        batch_ids = torch.arange(bs, device=feat.device, dtype=rois_xyxy.dtype).view(bs, 1, 1).expand(bs, query_count, 1)
+        rois = torch.cat((batch_ids, rois_xyxy), dim=-1).reshape(-1, 5)
+        pooled = torchvision.ops.roi_align(
+            feat,
+            rois,
+            output_size=(self.stem_roi_size, self.stem_roi_size),
+            spatial_scale=1.0,
+            aligned=True,
+        )
+        pooled = pooled.mean(dim=(-1, -2))
+        return pooled.reshape(bs, query_count, feat.shape[1])
+
+    def _apply_stem_spatial_guidance(
+        self,
+        offset_feature: torch.Tensor,
+        boxes_cxcywh: torch.Tensor,
+        proj_feats: List[torch.Tensor],
+        stem_geom_head,
+        stem_roi_proj_head,
+        stem_geom_proj_head,
+        stem_guidance_fusion_head,
+        stem_guidance_gate,
+    ):
+        if (
+            not self.use_stem_spatial_guidance
+            or stem_geom_head is None
+            or stem_roi_proj_head is None
+            or stem_geom_proj_head is None
+            or stem_guidance_fusion_head is None
+            or stem_guidance_gate is None
+        ):
+            return offset_feature, None, None
+
+        pred_stem_rel = stem_geom_head(offset_feature)
+        roi_geom = pred_stem_rel.detach() if self.stem_guidance_detach_geom_for_roi else pred_stem_rel
+        stem_roi_boxes = self._decode_stem_roi_boxes(roi_geom, boxes_cxcywh)
+        stem_roi_feat = self._pool_stem_roi_features(proj_feats, stem_roi_boxes)
+        stem_roi_proj = stem_roi_proj_head(stem_roi_feat).to(dtype=offset_feature.dtype)
+        stem_geom_proj = stem_geom_proj_head(pred_stem_rel).to(dtype=offset_feature.dtype)
+        stem_delta = stem_guidance_fusion_head(torch.cat((offset_feature, stem_roi_proj, stem_geom_proj), dim=-1))
+        gate = stem_guidance_gate.to(dtype=offset_feature.dtype)
+        guided_feature = offset_feature + gate * stem_delta
+        debug = None
+        if self.stem_guidance_debug:
+            debug = {
+                'stem_guidance_gate': gate.reshape(1),
+                'stem_roi_feature_norm': stem_roi_feat.detach().norm(dim=-1).mean().reshape(1),
+                'stem_roi_boxes_cxcywh': stem_roi_boxes.detach(),
+                'stem_guidance_delta_norm': stem_delta.detach().norm(dim=-1).mean().reshape(1),
+            }
+        return guided_feature, pred_stem_rel, debug
+
     def _predict_point_branch(
         self,
         hidden: torch.Tensor,
@@ -2046,6 +2259,11 @@ class DFINETransformer(nn.Module):
         dpo_x_head=None,
         dpo_y_head=None,
         roi_boxes_cxcywh: torch.Tensor = None,
+        stem_geom_head=None,
+        stem_roi_proj_head=None,
+        stem_geom_proj_head=None,
+        stem_guidance_fusion_head=None,
+        stem_guidance_gate=None,
     ):
         """Predict per-query has_picking logits, point offsets, and optional point reliability."""
         cls_feature = self._fuse_point_feature(
@@ -2086,7 +2304,35 @@ class DFINETransformer(nn.Module):
             )
         else:
             offset_feature = cls_feature
+        offset_feature, pred_stem_rel, stem_guidance_debug = self._apply_stem_spatial_guidance(
+            offset_feature,
+            boxes_cxcywh,
+            proj_feats,
+            stem_geom_head,
+            stem_roi_proj_head,
+            stem_geom_proj_head,
+            stem_guidance_fusion_head,
+            stem_guidance_gate,
+        )
         has_logits = cls_head(cls_feature)
+        # Point cross-attention: offset_feature attends to TopROI spatial map
+        if self.point_cross_attn is not None and proj_feats is not None:
+            spatial_map = self._pool_point_local_maps(
+                proj_feats, boxes_cxcywh, roi_type='top',
+                output_size=self.point_cross_attn_size,
+                top_roi_params=(
+                    self.point_offset_top_local_width_scale,
+                    self.point_offset_top_local_y_min_ratio,
+                    self.point_offset_top_local_y_max_ratio,
+                ) if self.point_decoupled_roi else None,
+            )  # [B, Q, C, H, W]
+            B, Q, C, H, W = spatial_map.shape
+            kv = spatial_map.reshape(B * Q, C, H * W).permute(0, 2, 1)  # [BQ, HW, C]
+            q = offset_feature.unsqueeze(1).reshape(B * Q, 1, C)  # [BQ, 1, C]
+            attn_out, _ = self.point_cross_attn(q, kv, kv)
+            attn_out = attn_out.reshape(B, Q, C)  # [B, Q, C]
+            attn_out = self.point_cross_attn_norm(attn_out + offset_feature)  # residual [B, Q, C]
+            offset_feature = offset_feature + self.point_cross_attn_proj(attn_out)
         base_picking_offsets = self._activate_point_offsets(offset_head(offset_feature))
         picking_offsets, qdpt_debug = self._apply_qdpt_lite(
             offset_feature,
@@ -2201,6 +2447,8 @@ class DFINETransformer(nn.Module):
             dpo_offsets,
             dpo_blend_offsets,
             dpo_debug,
+            pred_stem_rel,
+            stem_guidance_debug,
         )
 
     def _predict_grouped_picking_offsets(
@@ -2579,7 +2827,7 @@ class DFINETransformer(nn.Module):
             dn_out_hidden = None
 
         if self.use_picking_point_head:
-            pre_picking_logits, pre_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_point_reliability_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits, pre_qdpt_debug, pre_dpo_x_logits, pre_dpo_y_logits, pre_dpo_offsets, pre_dpo_blend_offsets, pre_dpo_debug = self._predict_point_branch(
+            pre_picking_logits, pre_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_point_reliability_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits, pre_qdpt_debug, pre_dpo_x_logits, pre_dpo_y_logits, pre_dpo_offsets, pre_dpo_blend_offsets, pre_dpo_debug, pre_stem_rel, pre_stem_guidance_debug = self._predict_point_branch(
                 pre_hidden,
                 pre_bboxes,
                 pre_logits,
@@ -2609,6 +2857,11 @@ class DFINETransformer(nn.Module):
                 self.pre_qdpt_gate,
                 self.pre_dpo_x_head,
                 self.pre_dpo_y_head,
+                stem_geom_head=self.pre_stem_geom_head,
+                stem_roi_proj_head=self.pre_stem_roi_proj,
+                stem_geom_proj_head=self.pre_stem_geom_proj,
+                stem_guidance_fusion_head=self.pre_stem_guidance_fusion,
+                stem_guidance_gate=self.pre_stem_guidance_gate,
             )
             pre_picking_offsets, pre_hrpb_debug = self._apply_hrpb_offsets(pre_picking_offsets, pre_bboxes, proj_feats)
             pre_grouped_picking_offsets = self._predict_grouped_picking_offsets(
@@ -2630,6 +2883,7 @@ class DFINETransformer(nn.Module):
             out_picking_logits_list = []
             out_picking_offsets_list = []
             out_stem_logits_list = []
+            out_stem_rel_list = []
             out_grouped_picking_offsets_list = []
             out_point_quality_logits_list = []
             out_point_selector_logits_list = []
@@ -2647,12 +2901,13 @@ class DFINETransformer(nn.Module):
             final_dpo_debug = None
             final_hrpb_debug = None
             final_c2f_debug = None
+            final_stem_guidance_debug = pre_stem_guidance_debug
             final_decoder_layer_idx = out_hidden.shape[0] - 1
             for layer_idx in range(out_hidden.shape[0]):
                 heatmap_head_i = None
                 if self.dec_toproi_heatmap_head is not None and layer_idx == final_decoder_layer_idx:
                     heatmap_head_i = self.dec_toproi_heatmap_head[layer_idx]
-                logits_i, offsets_i, quality_i, selector_i, accept_i, reliability_i, weak_heatmap_i, simcc_x_i, simcc_y_i, heatmap_i, qdpt_debug_i, dpo_x_i, dpo_y_i, dpo_offsets_i, dpo_blend_offsets_i, dpo_debug_i = self._predict_point_branch(
+                logits_i, offsets_i, quality_i, selector_i, accept_i, reliability_i, weak_heatmap_i, simcc_x_i, simcc_y_i, heatmap_i, qdpt_debug_i, dpo_x_i, dpo_y_i, dpo_offsets_i, dpo_blend_offsets_i, dpo_debug_i, stem_rel_i, stem_guidance_debug_i = self._predict_point_branch(
                     out_hidden[layer_idx],
                     out_bboxes[layer_idx],
                     out_logits[layer_idx],
@@ -2682,6 +2937,11 @@ class DFINETransformer(nn.Module):
                     self.dec_qdpt_gate[layer_idx] if self.dec_qdpt_gate is not None else None,
                     self.dec_dpo_x_head[layer_idx] if self.dec_dpo_x_head is not None else None,
                     self.dec_dpo_y_head[layer_idx] if self.dec_dpo_y_head is not None else None,
+                    stem_geom_head=self.dec_stem_geom_head[layer_idx] if self.dec_stem_geom_head is not None else None,
+                    stem_roi_proj_head=self.dec_stem_roi_proj[layer_idx] if self.dec_stem_roi_proj is not None else None,
+                    stem_geom_proj_head=self.dec_stem_geom_proj[layer_idx] if self.dec_stem_geom_proj is not None else None,
+                    stem_guidance_fusion_head=self.dec_stem_guidance_fusion[layer_idx] if self.dec_stem_guidance_fusion is not None else None,
+                    stem_guidance_gate=self.dec_stem_guidance_gate[layer_idx] if self.dec_stem_guidance_gate is not None else None,
                 )
                 offsets_i, hrpb_debug_i = self._apply_hrpb_offsets(offsets_i, out_bboxes[layer_idx], proj_feats)
                 stem_i = (
@@ -2706,6 +2966,8 @@ class DFINETransformer(nn.Module):
                 out_picking_offsets_list.append(offsets_i)
                 if stem_i is not None:
                     out_stem_logits_list.append(stem_i)
+                if stem_rel_i is not None:
+                    out_stem_rel_list.append(stem_rel_i)
                 if grouped_offsets_i is not None:
                     out_grouped_picking_offsets_list.append(grouped_offsets_i)
                 if quality_i is not None:
@@ -2734,9 +2996,11 @@ class DFINETransformer(nn.Module):
                     final_dpo_debug = dpo_debug_i
                     final_hrpb_debug = hrpb_debug_i
                     final_c2f_debug = c2f_debug_i
+                    final_stem_guidance_debug = stem_guidance_debug_i
             out_picking_logits = torch.stack(out_picking_logits_list) if out_picking_logits_list else None
             out_picking_offsets = torch.stack(out_picking_offsets_list) if out_picking_offsets_list else None
             out_stem_logits = torch.stack(out_stem_logits_list) if out_stem_logits_list else None
+            out_stem_rel = torch.stack(out_stem_rel_list) if out_stem_rel_list else None
             out_grouped_picking_offsets = torch.stack(out_grouped_picking_offsets_list) if out_grouped_picking_offsets_list else None
             out_point_quality_logits = torch.stack(out_point_quality_logits_list) if out_point_quality_logits_list else None
             out_point_selector_logits = torch.stack(out_point_selector_logits_list) if out_point_selector_logits_list else None
@@ -2764,7 +3028,7 @@ class DFINETransformer(nn.Module):
                 dn_out_toproi_simcc_y_logits_list = []
                 dn_out_toproi_heatmap_logits_list = []
                 for layer_idx in range(dn_out_hidden.shape[0]):
-                    logits_i, offsets_i, quality_i, selector_i, accept_i, reliability_i, weak_heatmap_i, simcc_x_i, simcc_y_i, heatmap_i, _, _, _, _, _, _ = self._predict_point_branch(
+                    logits_i, offsets_i, quality_i, selector_i, accept_i, reliability_i, weak_heatmap_i, simcc_x_i, simcc_y_i, heatmap_i, _, _, _, _, _, _, _, _ = self._predict_point_branch(
                         dn_out_hidden[layer_idx],
                         dn_out_bboxes[layer_idx],
                         dn_out_logits[layer_idx],
@@ -2842,7 +3106,7 @@ class DFINETransformer(nn.Module):
                 dn_out_picking_logits, dn_out_picking_offsets, dn_out_grouped_picking_offsets, dn_out_point_quality_logits, dn_out_point_selector_logits, dn_out_point_accept_logits, dn_out_point_reliability_logits, dn_out_weak_heatmap_logits, dn_out_toproi_simcc_x_logits, dn_out_toproi_simcc_y_logits, dn_out_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
 
             if dn_pre_hidden is not None:
-                dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_point_reliability_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits, _, _, _, _, _, _ = self._predict_point_branch(
+                dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_point_reliability_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits, _, _, _, _, _, _, _, _ = self._predict_point_branch(
                     dn_pre_hidden,
                     dn_pre_bboxes,
                     dn_pre_logits,
@@ -2891,6 +3155,7 @@ class DFINETransformer(nn.Module):
             out_picking_logits = None
             out_picking_offsets = None
             out_stem_logits = None
+            out_stem_rel = None
             out_grouped_picking_offsets = None
             out_point_quality_logits = None
             out_point_selector_logits = None
@@ -2907,8 +3172,9 @@ class DFINETransformer(nn.Module):
             final_dpo_debug = None
             final_hrpb_debug = None
             final_c2f_debug = None
+            final_stem_guidance_debug = None
             dn_out_picking_logits, dn_out_picking_offsets, dn_out_grouped_picking_offsets, dn_out_point_quality_logits, dn_out_point_selector_logits, dn_out_point_accept_logits, dn_out_point_reliability_logits, dn_out_weak_heatmap_logits, dn_out_toproi_simcc_x_logits, dn_out_toproi_simcc_y_logits, dn_out_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
-            pre_picking_logits, pre_picking_offsets, pre_stem_logits, pre_grouped_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_point_reliability_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None, None
+            pre_picking_logits, pre_picking_offsets, pre_stem_logits, pre_stem_rel, pre_grouped_picking_offsets, pre_point_quality_logits, pre_point_selector_logits, pre_point_accept_logits, pre_point_reliability_logits, pre_weak_heatmap_logits, pre_toproi_simcc_x_logits, pre_toproi_simcc_y_logits, pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None, None, None
             dn_pre_picking_logits, dn_pre_picking_offsets, dn_pre_grouped_picking_offsets, dn_pre_point_quality_logits, dn_pre_point_selector_logits, dn_pre_point_accept_logits, dn_pre_point_reliability_logits, dn_pre_weak_heatmap_logits, dn_pre_toproi_simcc_x_logits, dn_pre_toproi_simcc_y_logits, dn_pre_toproi_heatmap_logits = None, None, None, None, None, None, None, None, None, None, None
 
 
@@ -2921,8 +3187,16 @@ class DFINETransformer(nn.Module):
             # Final per-query outputs consumed by criterion and postprocessor.
             out['pred_has_picking'] = out_picking_logits[-1]
             out['pred_picking_offsets'] = out_picking_offsets[-1]
+            # Anchor correction for learnable anchor_y_bias
+            if self.anchor_y_bias is not None and self.training:
+                bias_correction = (self.anchor_y_bias.to(dtype=out['pred_picking_offsets'].dtype) - 0.12)
+                correction = torch.zeros_like(out['pred_picking_offsets'])
+                correction[..., 1] = bias_correction
+                out['pred_picking_offsets'] = out['pred_picking_offsets'] + correction
             if out_stem_logits is not None:
                 out['pred_has_stem'] = out_stem_logits[-1]
+            if out_stem_rel is not None:
+                out['pred_stem_rel'] = out_stem_rel[-1]
             if out_grouped_picking_offsets is not None:
                 out['pred_grouped_picking_offsets'] = out_grouped_picking_offsets[-1]
             if out_point_quality_logits is not None:
@@ -2971,6 +3245,11 @@ class DFINETransformer(nn.Module):
                     out['dpo_entropy_y'] = final_dpo_debug['entropy_y']
                     out['dpo_maxprob_x'] = final_dpo_debug['maxprob_x']
                     out['dpo_maxprob_y'] = final_dpo_debug['maxprob_y']
+            if self.use_stem_spatial_guidance and self.stem_guidance_debug and final_stem_guidance_debug is not None:
+                out['stem_guidance_gate'] = final_stem_guidance_debug['stem_guidance_gate']
+                out['stem_roi_feature_norm'] = final_stem_guidance_debug['stem_roi_feature_norm']
+                out['stem_roi_boxes_cxcywh'] = final_stem_guidance_debug['stem_roi_boxes_cxcywh']
+                out['stem_guidance_delta_norm'] = final_stem_guidance_debug['stem_guidance_delta_norm']
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss2(
@@ -2983,6 +3262,7 @@ class DFINETransformer(nn.Module):
                 out_picking_logits[:-1] if out_picking_logits is not None else None,
                 out_picking_offsets[:-1] if out_picking_offsets is not None else None,
                 out_stem_logits[:-1] if out_stem_logits is not None else None,
+                out_stem_rel[:-1] if out_stem_rel is not None else None,
                 out_grouped_picking_offsets[:-1] if out_grouped_picking_offsets is not None else None,
                 out_point_quality_logits[:-1] if out_point_quality_logits is not None else None,
                 out_point_selector_logits[:-1] if out_point_selector_logits is not None else None,
@@ -3000,6 +3280,8 @@ class DFINETransformer(nn.Module):
                 out['pre_outputs']['pred_picking_offsets'] = pre_picking_offsets
                 if pre_stem_logits is not None:
                     out['pre_outputs']['pred_has_stem'] = pre_stem_logits
+                if pre_stem_rel is not None:
+                    out['pre_outputs']['pred_stem_rel'] = pre_stem_rel
                 if pre_grouped_picking_offsets is not None:
                     out['pre_outputs']['pred_grouped_picking_offsets'] = pre_grouped_picking_offsets
                 if pre_point_quality_logits is not None:
@@ -3029,6 +3311,7 @@ class DFINETransformer(nn.Module):
                     dn_out_logits[-1],
                     dn_out_picking_logits,
                     dn_out_picking_offsets,
+                    None,
                     None,
                     dn_out_grouped_picking_offsets,
                     dn_out_point_quality_logits,
@@ -3119,6 +3402,7 @@ class DFINETransformer(nn.Module):
                        teacher_corners=None, teacher_logits=None,
                        outputs_picking_logits=None, outputs_picking_offsets=None,
                        outputs_stem_logits=None,
+                       outputs_stem_rel=None,
                        outputs_grouped_picking_offsets=None,
                        outputs_point_quality_logits=None,
                        outputs_point_selector_logits=None,
@@ -3147,6 +3431,8 @@ class DFINETransformer(nn.Module):
                 item['pred_picking_offsets'] = outputs_picking_offsets[idx]
             if outputs_stem_logits is not None:
                 item['pred_has_stem'] = outputs_stem_logits[idx]
+            if outputs_stem_rel is not None:
+                item['pred_stem_rel'] = outputs_stem_rel[idx]
             if outputs_grouped_picking_offsets is not None:
                 item['pred_grouped_picking_offsets'] = outputs_grouped_picking_offsets[idx]
             if outputs_point_quality_logits is not None:
